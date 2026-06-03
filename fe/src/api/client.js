@@ -72,3 +72,19 @@ export const getJobAudit = (jobId) =>
   api.get(`/jobs/${jobId}/audit`).then(r => r.data?.result ?? r.data);
 
 export const resetExcel = () => api.post('/reset').then(r => r.data);
+
+/* ── HITL (off-platform review) ────────────────────────────────────────────── */
+
+export const getHitlReviewDetail = (threadId) =>
+  api.get(`/opus/off-platform-review/${threadId}`).then(r => r.data);
+
+export const submitHitlReviewDecision = (threadId, decision, reviewerOutput) =>
+  api
+    .post(`/human-decision/${threadId}`, {
+      human_decision: decision,
+      reviewer_output: reviewerOutput || undefined,
+    })
+    .then(r => r.data);
+
+export const getHitlPending = () =>
+  api.get('/opus/off-platform-review/pending').then(r => r.data);

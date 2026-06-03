@@ -1,9 +1,163 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getInbox, openInboxUpdatesStream, resetExcel } from '../api/client';
 import StatusBadge from '../components/StatusBadge';
 import StatsBar from '../components/StatsBar';
 import LoadingSpinner from '../components/LoadingSpinner';
+
+/* ── Pending HITL Reviews table ───────────────────────────────────────────── */
+
+function HitlReviewsTable({ cases, onOpen }) {
+  if (cases.length === 0) {
+    return (
+      <div className="bg-white rounded-xl border border-dashed border-[#CBD5E1] p-6 text-center">
+        <p className="text-sm text-[#64748B]">No pending off-platform reviews.</p>
+        <p className="text-xs text-[#94A3B8] mt-1">Triggered workflows that reach an off-platform review node will appear here.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white rounded-xl border border-amber-200 shadow-sm overflow-hidden">
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="bg-amber-50 text-amber-900 text-xs uppercase tracking-wider">
+              <th className="text-left px-4 py-3 font-semibold">Workflow</th>
+              <th className="text-left px-4 py-3 font-semibold">Applicant</th>
+              <th className="text-left px-4 py-3 font-semibold">Review Node</th>
+              <th className="text-left px-4 py-3 font-semibold">Execution ID</th>
+              <th className="text-left px-4 py-3 font-semibold">Received</th>
+              <th className="text-left px-4 py-3 font-semibold">Status</th>
+              <th className="text-left px-4 py-3 font-semibold">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {cases.map((c, i) => (
+              <tr
+                key={c.thread_id || c.student_id}
+                onClick={() => onOpen(c)}
+                className={`cursor-pointer transition-colors ${i % 2 === 0 ? 'bg-white' : 'bg-amber-50/30'} hover:bg-amber-50`}
+              >
+                <td className="px-4 py-3">
+                  <div className="font-semibold text-[#002855] text-sm">
+                    {c.hitl_workflow_name || '(unnamed workflow)'}
+                  </div>
+                </td>
+                <td className="px-4 py-3">
+                  <div className="font-medium text-[#0F172A]">{c.applicant_name || '—'}</div>
+                  {c.student_id && (
+                    <div className="text-[11px] font-mono text-[#94A3B8]">{c.student_id}</div>
+                  )}
+                </td>
+                <td className="px-4 py-3 text-xs text-[#475569]">
+                  {c.hitl_node_name || '—'}
+                </td>
+                <td className="px-4 py-3 font-mono text-[11px] text-[#475569]">
+                  {(c.thread_id || '').slice(0, 12)}…
+                </td>
+                <td className="px-4 py-3 text-xs text-[#64748B] whitespace-nowrap">
+                  {c.submitted_at || '—'}
+                </td>
+                <td className="px-4 py-3 whitespace-nowrap">
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-100 text-amber-800 border border-amber-300">
+                    Pending Review
+                  </span>
+                </td>
+                <td className="px-4 py-3 whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
+                  <button
+                    onClick={() => onOpen(c)}
+                    className="px-3 py-1.5 rounded-lg bg-[#D97706] hover:bg-[#b45309] text-white text-xs font-semibold transition-all hover:scale-105 active:scale-95"
+                  >
+                    Review →
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ── Regular workflow applicants table ────────────────────────────────────── */
+
+function ApplicantsTable({ cases, onOpenScreen, onOpenView }) {
+  if (cases.length === 0) {
+    return (
+      <div className="bg-white rounded-xl border border-dashed border-[#CBD5E1] p-6 text-center">
+        <p className="text-sm text-[#64748B]">No applicants in the queue.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white rounded-xl border border-[#E2E8F0] shadow-sm overflow-hidden">
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="bg-[#E8F0F7] text-[#002855] text-xs uppercase tracking-wider">
+              <th className="text-left px-4 py-3 font-medium">Student ID</th>
+              <th className="text-left px-4 py-3 font-medium">Applicant Name</th>
+              <th className="text-left px-4 py-3 font-medium">Request Type</th>
+              <th className="text-left px-4 py-3 font-medium">Case Status</th>
+              <th className="text-left px-4 py-3 font-medium">Application Status</th>
+              <th className="text-left px-4 py-3 font-medium">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {cases.map((c, i) => {
+              const as = c.application_status?.toLowerCase() || '';
+              const isDone = ['process', 'selected', 'rejected', 'waitlisted', 'incomplete application'].includes(as);
+              return (
+                <tr
+                  key={c.student_id}
+                  onClick={() => isDone ? onOpenView(c) : onOpenScreen(c)}
+                  className={`cursor-pointer transition-colors ${i % 2 === 0 ? 'bg-white' : 'bg-[#F5F6F8]'} hover:bg-[#E8F0F7]`}
+                >
+                  <td className="px-4 py-3 font-mono text-xs text-[#374151] whitespace-nowrap">{c.student_id}</td>
+                  <td className="px-4 py-3 font-semibold text-[#002855] whitespace-nowrap">{c.applicant_name}</td>
+                  <td className="px-4 py-3 whitespace-nowrap">
+                    <StatusBadge value={c.request_type} kind="request" />
+                  </td>
+                  <td className="px-4 py-3 whitespace-nowrap">
+                    <StatusBadge value={c.case_status} kind="application" />
+                  </td>
+                  <td className="px-4 py-3 whitespace-nowrap">
+                    <StatusBadge value={c.application_status} kind="application" />
+                  </td>
+                  <td className="px-4 py-3 whitespace-nowrap" onClick={e => e.stopPropagation()}>
+                    {isDone ? (
+                      <button
+                        onClick={() => onOpenView(c)}
+                        className="px-3 py-1.5 rounded-lg border border-[#1D4ED8] text-[#1D4ED8] bg-[#E8F0F7] hover:bg-[#d0e2f3] text-xs font-semibold transition-all hover:scale-105 active:scale-95"
+                      >
+                        View Details →
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => onOpenScreen(c)}
+                        className="px-3 py-1.5 rounded-lg bg-[#002855] hover:bg-[#003a7a] text-white text-xs font-semibold transition-all hover:scale-105 active:scale-95"
+                      >
+                        Start Screening →
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="px-4 py-3 bg-[#F5F6F8] border-t border-[#E2E8F0] text-xs text-[#9CA3AF]">
+        {cases.length} applicant{cases.length === 1 ? '' : 's'}
+      </div>
+    </div>
+  );
+}
+
+/* ── Main page ────────────────────────────────────────────────────────────── */
 
 export default function InboxPage() {
   const [cases, setCases]     = useState([]);
@@ -43,30 +197,38 @@ export default function InboxPage() {
 
   useEffect(() => { fetchInbox(); }, [fetchInbox]);
 
-  // POC mode: rely on backend webhook -> SSE updates instead of frontend polling.
   useEffect(() => {
     const stream = openInboxUpdatesStream({
-      onSnapshot: (payload) => {
-        setCases(Array.isArray(payload?.cases) ? payload.cases : []);
-      },
-      onJobUpdate: (payload) => {
-        setCases(Array.isArray(payload?.cases) ? payload.cases : []);
-      },
-      onError: () => {
-        // EventSource auto-reconnects; keep UI state as-is.
-      },
+      onSnapshot: (payload) => setCases(Array.isArray(payload?.cases) ? payload.cases : []),
+      onJobUpdate: (payload) => setCases(Array.isArray(payload?.cases) ? payload.cases : []),
+      onError: () => { /* EventSource auto-reconnects */ },
     });
-
     return () => stream.close();
   }, []);
 
+  // Partition: HITL reviews (off-platform) vs regular workflow applicants.
+  const { hitlCases, applicantCases } = useMemo(() => {
+    const hitl = [];
+    const applicants = [];
+    for (const c of cases) {
+      if (c.is_off_platform_review || c.thread_id) {
+        hitl.push(c);
+      } else {
+        applicants.push(c);
+      }
+    }
+    return { hitlCases: hitl, applicantCases: applicants };
+  }, [cases]);
+
+  const openHitl = (c) => navigate(`/hitl/${c.thread_id || c.student_id}`);
+  const openScreen = (c) => navigate(`/case/${c.student_id}`, { state: { mode: 'screen' } });
+  const openView = (c) => navigate(`/case/${c.student_id}`, { state: { mode: 'view' } });
+
   return (
     <div className="min-h-screen bg-[#F5F6F8]">
-      {/* ── Header ── */}
       <header className="bg-[#002855] text-white px-6 py-5 shadow-md">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <span className="text-3xl">🎓</span>
             <div>
               <h1 className="text-xl font-bold tracking-tight">Laureate Application Screening</h1>
               <p className="text-xs text-[#9CA3AF] mt-0.5">Admissions Review Dashboard</p>
@@ -98,140 +260,61 @@ export default function InboxPage() {
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-6 py-8">
-        {/* ── Error Banner ── */}
+      <main className="max-w-7xl mx-auto px-6 py-8 space-y-8">
         {error && (
-          <div className="mb-6 rounded-xl border border-red-300 bg-red-50 p-4 flex items-start gap-3">
-            <span className="text-red-500 text-lg flex-shrink-0">✕</span>
+          <div className="rounded-xl border border-red-300 bg-red-50 p-4 flex items-start gap-3">
             <div className="flex-1">
               <p className="text-sm font-semibold text-red-700">Error loading inbox</p>
               <p className="text-xs text-red-600 mt-0.5">{error}</p>
             </div>
-            <button
-              onClick={fetchInbox}
-              className="text-xs font-medium text-[#1D4ED8] hover:underline flex-shrink-0"
-            >
+            <button onClick={fetchInbox} className="text-xs font-medium text-[#1D4ED8] hover:underline flex-shrink-0">
               Retry
             </button>
           </div>
         )}
 
-        {/* ── Stats Bar ── */}
-        {!loading && !error && <StatsBar cases={cases} />}
+        {!loading && !error && <StatsBar cases={applicantCases} />}
 
-        {/* ── Loading ── */}
         {loading && <LoadingSpinner message="Fetching applications…" />}
 
-        {/* ── Empty State ── */}
-        {!loading && !error && cases.length === 0 && (
-          <div className="flex flex-col items-center justify-center py-24 gap-3">
-            <span className="text-5xl">📭</span>
-            <p className="text-base font-semibold text-gray-500">No applications found</p>
-            <p className="text-sm text-gray-400">The inbox is empty. Check back later.</p>
-          </div>
-        )}
+        {!loading && !error && (
+          <>
+            {/* Section 1: Pending Human Reviews — distinct amber theme, always visible */}
+            <section>
+              <div className="flex items-baseline justify-between mb-3 flex-wrap gap-2">
+                <div className="flex items-baseline gap-3">
+                  <h2 className="text-lg font-bold text-[#92400e]">
+                    Pending Human Reviews
+                  </h2>
+                  <span className="text-xs font-semibold bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full border border-amber-300">
+                    {hitlCases.length}
+                  </span>
+                </div>
+                <p className="text-xs text-[#64748B]">
+                  Off-platform review tasks dispatched by OPUS workflows
+                </p>
+              </div>
+              <HitlReviewsTable cases={hitlCases} onOpen={openHitl} />
+            </section>
 
-        {/* ── Table ── */}
-        {!loading && !error && cases.length > 0 && (
-          <div className="bg-white rounded-xl border border-[#E2E8F0] shadow-sm overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="bg-[#E8F0F7] text-[#002855] text-xs uppercase tracking-wider">
-                    <th className="text-left px-4 py-3 font-medium">Student ID</th>
-                    <th className="text-left px-4 py-3 font-medium">Applicant Name</th>
-                    <th className="text-left px-4 py-3 font-medium">Request Type</th>
-                    <th className="text-left px-4 py-3 font-medium">Case Status</th>
-                    <th className="text-left px-4 py-3 font-medium">Application Status</th>
-                    <th className="text-left px-4 py-3 font-medium">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {cases.map((c, i) => (
-                    <tr
-                      key={c.student_id}
-                      onClick={() => {
-                        const as = c.application_status?.toLowerCase() || '';
-                        const isDone =
-                          Boolean(c.is_human_review_ready) ||
-                          ['process', 'selected', 'rejected', 'waitlisted', 'incomplete application'].includes(as);
-                        navigate(`/case/${c.student_id}`, { state: { mode: isDone ? 'view' : 'screen' } });
-                      }}
-                      className={`
-                        cursor-pointer transition-colors
-                        ${i % 2 === 0 ? 'bg-white' : 'bg-[#F5F6F8]'}
-                        hover:bg-[#E8F0F7]
-                      `}
-                    >
-                      {/* Student ID */}
-                      <td className="px-4 py-3 font-mono text-xs text-[#374151] whitespace-nowrap">
-                        {c.student_id}
-                      </td>
-
-                      {/* Name */}
-                      <td className="px-4 py-3 font-semibold text-[#002855] whitespace-nowrap">
-                        {c.applicant_name}
-                      </td>
-
-                      {/* Request Type */}
-                      <td className="px-4 py-3 whitespace-nowrap">
-                        <StatusBadge value={c.request_type} kind="request" />
-                      </td>
-
-                      <td className="px-4 py-3 whitespace-nowrap">
-                        <StatusBadge value={c.case_status} kind="application" />
-                      </td>
-
-                      {/* Application Status */}
-                      <td className="px-4 py-3 whitespace-nowrap">
-                        <StatusBadge value={c.application_status} kind="application" />
-                      </td>
-
-                      {/* Action */}
-                      <td
-                        className="px-4 py-3 whitespace-nowrap"
-                        onClick={e => e.stopPropagation()}
-                      >
-                        {(() => {
-                          const as = c.application_status?.toLowerCase() || '';
-                          const isDone =
-                            Boolean(c.is_human_review_ready) ||
-                            ['process', 'selected', 'rejected', 'waitlisted', 'incomplete application'].includes(as);
-                          return isDone ? (
-                            <button
-                              onClick={() => navigate(`/case/${c.student_id}`, { state: { mode: 'view' } })}
-                              className="
-                                px-3 py-1.5 rounded-lg border border-[#1D4ED8]
-                                text-[#1D4ED8] bg-[#E8F0F7] hover:bg-[#d0e2f3]
-                                text-xs font-semibold transition-all
-                                hover:scale-105 active:scale-95
-                              "
-                            >
-                              View Details →
-                            </button>
-                          ) : (
-                            <button
-                              onClick={() => navigate(`/case/${c.student_id}`, { state: { mode: 'screen' } })}
-                              className="
-                                px-3 py-1.5 rounded-lg bg-[#002855] hover:bg-[#003a7a]
-                                text-white text-xs font-semibold transition-all
-                                hover:scale-105 active:scale-95
-                              "
-                            >
-                              Start Screening →
-                            </button>
-                          );
-                        })()}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="px-4 py-3 bg-[#F5F6F8] border-t border-[#E2E8F0] text-xs text-[#9CA3AF]">
-              {cases.length} application{cases.length === 1 ? '' : 's'}
-            </div>
-          </div>
+            {/* Section 2: Regular workflow applicants */}
+            <section>
+              <div className="flex items-baseline justify-between mb-3 flex-wrap gap-2">
+                <div className="flex items-baseline gap-3">
+                  <h2 className="text-lg font-bold text-[#002855]">
+                    Applicants
+                  </h2>
+                  <span className="text-xs font-semibold bg-[#E8F0F7] text-[#002855] px-2 py-0.5 rounded-full border border-[#cbd5e1]">
+                    {applicantCases.length}
+                  </span>
+                </div>
+                <p className="text-xs text-[#64748B]">
+                  Regular workflow cases — trigger screening or view results
+                </p>
+              </div>
+              <ApplicantsTable cases={applicantCases} onOpenScreen={openScreen} onOpenView={openView} />
+            </section>
+          </>
         )}
       </main>
     </div>

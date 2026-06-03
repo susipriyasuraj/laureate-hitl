@@ -515,6 +515,14 @@ const toInboxCase = (job) => ({
     Boolean(job.isOffPlatformReview) ||
     job.status === "HITL_PENDING" ||
     normalizeActions(job.available_actions).length > 0,
+  // Surface the HITL thread id (== OPUS execution id) so the FE can navigate
+  // straight to /hitl/:threadId for off-platform reviews instead of the
+  // legacy /case/:studentId screening detail page.
+  thread_id: Boolean(job.isOffPlatformReview) ? String(job.jobId || "") : null,
+  is_off_platform_review: Boolean(job.isOffPlatformReview),
+  hitl_workflow_name: job.hitlWorkflowName || null,
+  hitl_node_name: job.hitlWorkflowMeta?.review_node?.name || null,
+  submitted_at: job.submittedAt || null,
 });
 
 const resolveScreeningStatus = (job = {}) => {
@@ -1384,7 +1392,8 @@ export const offPlatformReviewWebhookController = async (req, res) => {
         });
       }
 
-      const task = buildHitlTaskFromWebhook(payload);
+      // Async: enrichment fetches workflow definition from OPUS for display labels.
+      const task = await buildHitlTaskFromWebhook(payload);
       const existing = getAllJobs().find(
         (item) => String(item.jobId || "") === String(task.jobId)
       );
@@ -1487,10 +1496,31 @@ export const getOffPlatformReviewDetailController = async (req, res) => {
       case_status: resolveCaseStatus(job),
       decision: resolveDecision(job),
       available_actions: normalizeActions(job.available_actions),
+      submitted_at: job.submittedAt || null,
+
+      // Raw upstream-node data from the dispatch (what the reviewer needs to judge).
       input_context: job.hitlInputs || {},
       node_output: job.hitlNodeOutput || {},
+      input_schema: job.hitlInputSchema || {},
+      node_output_schema: job.hitlNodeOutputSchema || {},
+      process: job.hitlProcess || {},
+
+      // Workflow + node metadata fetched from the OPUS Reference Workflow API.
+      // Provides display names + descriptions so the FE can render labels
+      // instead of bare variable_name keys. May be null if the fetch failed.
+      workflow_meta: job.hitlWorkflowMeta || null,
+
+      // Reviewer-facing schema for the form widgets to render.
       expected_output_schema: job.hitlExpectedOutputSchema || null,
+
       hitl_status: String(job.hitlStatus || "PENDING"),
+
+      // Last callback attempt — present after the reviewer has submitted at
+      // least once. Used to surface OPUS errors and show the request preview.
+      last_callback_status: job.hitlLastCallbackStatus || null,
+      last_callback_response: job.hitlLastCallbackResponseBody || null,
+      last_callback_payload: job.hitlLastCallbackPayload || null,
+
       audit_log: Array.isArray(job.hitlAuditLog) ? job.hitlAuditLog : [],
     });
   } catch (error) {

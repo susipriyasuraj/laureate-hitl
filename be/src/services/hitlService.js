@@ -2,6 +2,7 @@ import axios from "axios";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { opusHitlWebhookSchema } from "../schemas/opusHitlWebhookSchema.js";
+import { buildWorkflowReviewMeta, getV2WorkflowObject } from "./opusWorkflowService.js";
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 addFormats(ajv);
@@ -115,7 +116,7 @@ export const validateHitlWebhookPayload = (payload = {}) => {
   return { ok: false, errors };
 };
 
-export const buildHitlTaskFromWebhook = (payload = {}) => {
+export const buildHitlTaskFromWebhook = async (payload = {}) => {
   const reviewValue = payload.inputs?.review_node?.value || {};
 
   // Tolerate both OPUS payload shapes:
@@ -146,6 +147,25 @@ export const buildHitlTaskFromWebhook = (payload = {}) => {
     readTyped(inputValues, "name") ||
     `Applicant ${studentId}`;
 
+  // Best-effort: enrich the job with workflow + upstream-node metadata fetched
+  // from the OPUS Reference Workflow API. Gives the FE display names for the
+  // dispatch's bare `variable_name` keys, the upstream node's name, etc.
+  // Falls back to null on any failure — the rest of the flow proceeds.
+  let workflowMeta = null;
+  try {
+    const workflowObj = await getV2WorkflowObject(payload.workflow_id);
+    workflowMeta = buildWorkflowReviewMeta(workflowObj);
+  } catch (e) {
+    // Logged inside getV2WorkflowObject; swallow here so dispatch always lands.
+  }
+
+  // Prefer the workflow's name from the API (richer) when the dispatch didn't
+  // carry workflow_name or carried the placeholder "Untitled Workflow".
+  const resolvedWorkflowName =
+    payload.workflow_name && payload.workflow_name !== "Untitled Workflow"
+      ? payload.workflow_name
+      : workflowMeta?.workflow_name || payload.workflow_name || "";
+
   return {
     jobId: String(payload.execution_id),
     studentId: String(studentId),
@@ -165,7 +185,7 @@ export const buildHitlTaskFromWebhook = (payload = {}) => {
 
     hitlExecutionId: String(payload.execution_id),
     hitlWorkflowId: String(payload.workflow_id),
-    hitlWorkflowName: String(payload.workflow_name || ""),
+    hitlWorkflowName: String(resolvedWorkflowName),
     hitlNodeExecutionId: String(nodeExecutionId),
 
     hitlInputs: inputValues,
@@ -173,6 +193,8 @@ export const buildHitlTaskFromWebhook = (payload = {}) => {
     hitlInputSchema: inputSchema,
     hitlNodeOutputSchema: outputSchema,
     hitlProcess: reviewValue.process || {},
+
+    hitlWorkflowMeta: workflowMeta,
 
     hitlCallback: {
       url: String(payload.callback?.url || ""),
