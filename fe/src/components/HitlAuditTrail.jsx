@@ -5,19 +5,16 @@ import { useState } from 'react';
 const EVENT_META = {
   webhook_received: {
     label: 'Dispatch received from OPUS',
-    icon: '📥',
     color: 'bg-blue-50 border-blue-200 text-blue-800',
     dotColor: 'bg-blue-500',
   },
   review_submitted: {
     label: 'Reviewer submitted decision',
-    icon: '✍️',
     color: 'bg-green-50 border-green-200 text-green-800',
     dotColor: 'bg-green-500',
   },
   hitl_event: {
     label: 'HITL event',
-    icon: '·',
     color: 'bg-gray-50 border-gray-200 text-gray-700',
     dotColor: 'bg-gray-400',
   },
@@ -65,7 +62,6 @@ function EventCard({ event, isLast }) {
       {/* Card */}
       <div className={`flex-1 rounded-lg border ${meta.color} p-3 mb-3`}>
         <div className="flex items-start gap-2 flex-wrap">
-          <span className="text-lg leading-none flex-shrink-0">{meta.icon}</span>
           <div className="flex-1 min-w-0">
             <div className="flex items-baseline gap-2 flex-wrap">
               <span className="font-semibold text-sm">{meta.label}</span>

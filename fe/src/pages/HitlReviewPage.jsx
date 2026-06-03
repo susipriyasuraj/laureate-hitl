@@ -104,7 +104,6 @@ export default function HitlReviewPage() {
           </button>
           <span className="text-[#475569]">|</span>
           <div className="flex items-center gap-2">
-            <span className="text-xl">🧑‍⚖️</span>
             <span className="font-semibold text-white">Off-Platform Human Review</span>
           </div>
           {detail?.hitl_status && (
@@ -169,7 +168,7 @@ export default function HitlReviewPage() {
             {detail.hitl_status === 'SUBMITTED' && submittedResult && (
               <div className="rounded-xl border border-green-300 bg-green-50 p-4">
                 <p className="text-sm font-semibold text-green-800">
-                  ✓ Decision submitted and accepted by OPUS
+                  Decision submitted and accepted by OPUS
                 </p>
                 <p className="text-xs text-green-700 mt-1">
                   Workflow has resumed downstream of the review node. Decision: <strong>{submittedResult.decision}</strong>

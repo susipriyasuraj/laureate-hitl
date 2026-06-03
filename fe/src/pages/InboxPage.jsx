@@ -229,7 +229,6 @@ export default function InboxPage() {
       <header className="bg-[#002855] text-white px-6 py-5 shadow-md">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <span className="text-3xl">🎓</span>
             <div>
               <h1 className="text-xl font-bold tracking-tight">Laureate Application Screening</h1>
               <p className="text-xs text-[#9CA3AF] mt-0.5">Admissions Review Dashboard</p>
@@ -264,7 +263,6 @@ export default function InboxPage() {
       <main className="max-w-7xl mx-auto px-6 py-8 space-y-8">
         {error && (
           <div className="rounded-xl border border-red-300 bg-red-50 p-4 flex items-start gap-3">
-            <span className="text-red-500 text-lg flex-shrink-0">✕</span>
             <div className="flex-1">
               <p className="text-sm font-semibold text-red-700">Error loading inbox</p>
               <p className="text-xs text-red-600 mt-0.5">{error}</p>
@@ -285,9 +283,8 @@ export default function InboxPage() {
             <section>
               <div className="flex items-baseline justify-between mb-3 flex-wrap gap-2">
                 <div className="flex items-baseline gap-3">
-                  <h2 className="text-lg font-bold text-[#92400e] flex items-center gap-2">
-                    <span className="text-xl">🧑‍⚖️</span>
-                    <span>Pending Human Reviews</span>
+                  <h2 className="text-lg font-bold text-[#92400e]">
+                    Pending Human Reviews
                   </h2>
                   <span className="text-xs font-semibold bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full border border-amber-300">
                     {hitlCases.length}
@@ -304,9 +301,8 @@ export default function InboxPage() {
             <section>
               <div className="flex items-baseline justify-between mb-3 flex-wrap gap-2">
                 <div className="flex items-baseline gap-3">
-                  <h2 className="text-lg font-bold text-[#002855] flex items-center gap-2">
-                    <span className="text-xl">🎓</span>
-                    <span>Applicants</span>
+                  <h2 className="text-lg font-bold text-[#002855]">
+                    Applicants
                   </h2>
                   <span className="text-xs font-semibold bg-[#E8F0F7] text-[#002855] px-2 py-0.5 rounded-full border border-[#cbd5e1]">
                     {applicantCases.length}
