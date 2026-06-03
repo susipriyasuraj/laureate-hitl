@@ -8,6 +8,10 @@ addFormats(ajv);
 
 const validateIncomingWebhook = ajv.compile(opusHitlWebhookSchema);
 
+// OPUS dispatches use a mix of Python-style aliases ("str", "int", "bool") and the
+// canonical wire names from the integration guide ("string", "integer", "boolean").
+// We normalize for validation only — the type echoed back in the callback is the
+// dispatch's own allowed_types entry verbatim, so OPUS sees its own names.
 const TYPE_ALIASES = {
   str: "string",
   string: "string",
@@ -39,6 +43,31 @@ const readTyped = (source, key) => {
     return item.value;
   }
   return item;
+};
+
+// Pick the first non-empty value from multiple candidate keys. Lets us read
+// the review_node.value blob whether OPUS uses `inputs/outputs` (per the
+// integration guide) or `input/output` (observed in older dispatches).
+const firstObject = (...candidates) => {
+  for (const c of candidates) {
+    if (c && typeof c === "object" && !Array.isArray(c) && Object.keys(c).length > 0) {
+      return c;
+    }
+  }
+  // Fall back to first non-null even if empty, so callers still get an object.
+  for (const c of candidates) {
+    if (c && typeof c === "object" && !Array.isArray(c)) {
+      return c;
+    }
+  }
+  return {};
+};
+
+const firstString = (...candidates) => {
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim()) return c;
+  }
+  return "";
 };
 
 const toDecisionToken = (decision) => {
@@ -88,8 +117,21 @@ export const validateHitlWebhookPayload = (payload = {}) => {
 
 export const buildHitlTaskFromWebhook = (payload = {}) => {
   const reviewValue = payload.inputs?.review_node?.value || {};
-  const inputValues = reviewValue.input || {};
-  const outputValues = reviewValue.output || {};
+
+  // Tolerate both OPUS payload shapes:
+  //  - Integration guide: { inputs, outputs, schema: {inputs, outputs}, node_id, process }
+  //  - Older / observed:  { input, output, input_schema, output_schema, node_execution_id }
+  // Also tolerate the degenerate case where `value` IS the upstream output dict.
+  const inputValues = firstObject(reviewValue.input, reviewValue.inputs);
+  const outputValues = firstObject(
+    reviewValue.output,
+    reviewValue.outputs,
+    // Degenerate case: a Code node's output dict lives directly under `value`.
+    Object.keys(inputValues).length === 0 ? reviewValue : null,
+  );
+  const inputSchema = firstObject(reviewValue.input_schema, reviewValue.schema?.inputs);
+  const outputSchema = firstObject(reviewValue.output_schema, reviewValue.schema?.outputs);
+  const nodeExecutionId = firstString(reviewValue.node_execution_id, reviewValue.node_id);
   const expectedSchema = payload.expected_output_schema || { schema: {} };
 
   const studentId =
@@ -124,12 +166,12 @@ export const buildHitlTaskFromWebhook = (payload = {}) => {
     hitlExecutionId: String(payload.execution_id),
     hitlWorkflowId: String(payload.workflow_id),
     hitlWorkflowName: String(payload.workflow_name || ""),
-    hitlNodeExecutionId: String(reviewValue.node_execution_id || ""),
+    hitlNodeExecutionId: String(nodeExecutionId),
 
     hitlInputs: inputValues,
     hitlNodeOutput: outputValues,
-    hitlInputSchema: reviewValue.input_schema || {},
-    hitlNodeOutputSchema: reviewValue.output_schema || {},
+    hitlInputSchema: inputSchema,
+    hitlNodeOutputSchema: outputSchema,
     hitlProcess: reviewValue.process || {},
 
     hitlCallback: {
@@ -337,16 +379,22 @@ export const buildAndValidateHitlOutput = ({
     return { ok: false, errors, outputByVarName: null, callbackOutput: null };
   }
 
+  // Build the callback's output_data — keyed by the schema's outer key (the
+  // variable_name / auto-id like "workflow_output_xyz"), with each value wrapped
+  // as {value, type} per integration guide §5.2. The `type` is passed through
+  // from the dispatch's own allowed_types[0] so OPUS sees its own type names
+  // back (e.g. "bool" not "boolean", matching what it sent).
   const callbackOutput = {};
-  for (const varDef of Object.values(schema)) {
-    const variableName = String(varDef?.variable_name || "");
-    const id = String(varDef?.id || "");
+  for (const [schemaKey, varDef] of Object.entries(schema)) {
+    const variableName = String(varDef?.variable_name || schemaKey);
     const value = outputByVarName[variableName];
+    const allowedTypes = Array.isArray(varDef?.allowed_types) ? varDef.allowed_types : [];
+    const dispatchedType = allowedTypes[0] || { type: "string", type_definition: null };
 
-    callbackOutput[variableName] = value;
-    if (id) {
-      callbackOutput[id] = value;
-    }
+    callbackOutput[schemaKey] = {
+      value,
+      type: dispatchedType,
+    };
   }
 
   return {
@@ -357,7 +405,7 @@ export const buildAndValidateHitlOutput = ({
   };
 };
 
-export const sendHitlCallback = async ({ callback, callbackOutput }) => {
+export const sendHitlCallback = async ({ callback, callbackOutput, status = "success", error = null }) => {
   const headerName = String(callback?.token_header || "").trim();
   const tokenValue = String(callback?.token || "").trim();
   const url = String(callback?.url || "").trim();
@@ -371,17 +419,28 @@ export const sendHitlCallback = async ({ callback, callbackOutput }) => {
     [headerName]: tokenValue,
   };
 
+  // Per integration guide §5.2:
+  //   { output_data: { <key>: { value, type } }, status: "success"|"failed", error? }
   const body = {
-    output: callbackOutput,
+    output_data: callbackOutput || {},
+    status,
   };
+  if (status === "failed" && error) {
+    body.error = String(error);
+  }
 
+  // Don't throw on non-2xx — let the caller surface the real status code to
+  // the reviewer (e.g. 401 = expired, 400 = validation, 404 = unknown execution).
   const response = await axios.post(url, body, {
     headers,
     timeout: 20000,
+    validateStatus: () => true,
   });
 
   return {
     status: response.status,
     data: response.data,
+    ok: response.status >= 200 && response.status < 300,
+    sentBody: body,
   };
 };

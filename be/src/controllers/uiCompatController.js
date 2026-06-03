@@ -1576,9 +1576,14 @@ export const submitHumanDecisionController = async (req, res) => {
         });
       }
 
+      // The reviewer's decision (approve/reject/etc.) is a business outcome encoded
+      // in output_data. The callback's `status` reflects whether the review itself
+      // succeeded as a technical handshake — always "success" here unless the action
+      // explicitly signals an inability to complete.
       const callbackResult = await sendHitlCallback({
         callback: job.hitlCallback,
         callbackOutput: validation.callbackOutput,
+        status: "success",
       });
 
       const updatedHitlAudit = [
@@ -1590,23 +1595,48 @@ export const submitHumanDecisionController = async (req, res) => {
           reviewer_output: reviewerOutput,
           callback_output: validation.callbackOutput,
           callback_status: callbackResult.status,
+          callback_ok: callbackResult.ok,
         },
       ];
 
+      const hitlStatus = callbackResult.ok ? "SUBMITTED" : "CALLBACK_FAILED";
+
       const updated = updateJobResult(threadId, {
-        decision: mapped.decision,
-        application_status: mapped.application_status,
-        case_status: mapped.case_status,
-        workflow_output_p1e47k0wq: mapped.application_status,
-        workflow_output_i7abcyo03: mapped.application_status,
-        available_actions: [],
-        hitlStatus: "SUBMITTED",
+        // Only mark the decision as final if OPUS accepted the callback. If OPUS
+        // rejected it, the workflow is still paused — surfacing the decision as
+        // final in our UI would mislead the reviewer into thinking it stuck.
+        ...(callbackResult.ok
+          ? {
+              decision: mapped.decision,
+              application_status: mapped.application_status,
+              case_status: mapped.case_status,
+              workflow_output_p1e47k0wq: mapped.application_status,
+              workflow_output_i7abcyo03: mapped.application_status,
+              available_actions: [],
+            }
+          : {}),
+        hitlStatus,
         hitlLastOutput: validation.outputByVarName,
-        hitlLastCallbackPayload: { output: validation.callbackOutput },
+        hitlLastCallbackPayload: callbackResult.sentBody,
         hitlLastCallbackStatus: callbackResult.status,
+        hitlLastCallbackResponseBody: callbackResult.data,
         hitlAuditLog: updatedHitlAudit,
         offPlatformDecisionSubmittedAt: new Date().toISOString(),
       });
+
+      if (!callbackResult.ok) {
+        // Surface OPUS's status code and body so the FE can render a meaningful
+        // message ("review expired" for 401, "validation failed" for 400, etc.)
+        // instead of a generic 500.
+        return res.status(502).json({
+          detail: "OPUS rejected the callback",
+          opus_status: callbackResult.status,
+          opus_body: callbackResult.data,
+          sent_body: callbackResult.sentBody,
+          thread_id: threadId,
+          hitl_status: hitlStatus,
+        });
+      }
 
       return res.status(200).json({
         decision: mapped.decision,
