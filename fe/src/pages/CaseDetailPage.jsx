@@ -293,7 +293,30 @@ export default function CaseDetailPage() {
       );
       setFinalResult(result);
     } catch (err) {
-      setDecisionError(err?.response?.data?.detail || err.message || 'Decision submission failed.');
+      // BE returns 502 with { opus_status, opus_body, sent_body } when OPUS
+      // accepted the receipt but rejected the callback body. Surface that
+      // explicitly so the reviewer knows what to do.
+      const data = err?.response?.data;
+      if (data?.opus_status) {
+        const opusStatus = data.opus_status;
+        const statusMessage =
+          opusStatus === 401
+            ? 'This review has expired or its callback token was already used. The workflow may have timed out.'
+            : opusStatus === 400
+              ? 'OPUS rejected the output values. Check that every required field is filled with the correct type.'
+              : opusStatus === 404
+                ? 'OPUS could not find this execution. The workflow may have been stopped or restarted.'
+                : `OPUS rejected the callback (HTTP ${opusStatus}).`;
+        const opusDetail =
+          typeof data.opus_body === 'string'
+            ? data.opus_body
+            : JSON.stringify(data.opus_body || {}, null, 2);
+        setDecisionError(
+          `${statusMessage}\n\nOPUS response: ${opusDetail.slice(0, 500)}`
+        );
+      } else {
+        setDecisionError(data?.detail || err.message || 'Decision submission failed.');
+      }
     } finally {
       setDecisionLoading(null);
     }
@@ -460,6 +483,7 @@ export default function CaseDetailPage() {
                 <HumanReviewPanel
                   agentDecision={screeningResult.decision}
                   availableActions={screeningResult.available_actions}
+                  expectedOutputSchema={screeningResult.expected_output_schema}
                   loading={decisionLoading}
                   onDecision={handleDecision}
                 />
@@ -484,9 +508,9 @@ function ErrorBanner({ title, message, onRetry }) {
   return (
     <div className="rounded-xl border border-red-300 bg-red-50 p-4 flex items-start gap-3">
       <span className="text-red-500 text-lg flex-shrink-0">✕</span>
-      <div className="flex-1">
+      <div className="flex-1 min-w-0">
         <p className="text-sm font-semibold text-red-700">{title}</p>
-        <p className="text-xs text-red-600 mt-0.5">{message}</p>
+        <p className="text-xs text-red-600 mt-0.5 whitespace-pre-line break-words font-mono">{message}</p>
       </div>
       {onRetry && (
         <button
