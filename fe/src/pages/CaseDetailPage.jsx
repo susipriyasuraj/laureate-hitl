@@ -50,12 +50,14 @@ function getBannerStyle(decision, caseStatus) {
 }
 
 function getBannerIcon(decision, caseStatus) {
+  // Reserved for future inline-icon variant; emoji glyphs intentionally
+  // removed in favour of text labels and CSS-driven status colours.
   const d = decision?.toLowerCase() || '';
   const cs = caseStatus?.toLowerCase() || '';
-  if (d === 'selected' || cs === 'closed') return '✅';
-  if (d === 'deny') return '❌';
-  if (d === 'incomplete application') return '⚠';
-  return '🕐';
+  if (d === 'selected' || cs === 'closed') return '';
+  if (d === 'deny') return '';
+  if (d === 'incomplete application') return '';
+  return '';
 }
 
 /* ── Decision Summary Card ── */
@@ -337,7 +339,6 @@ export default function CaseDetailPage() {
           </button>
           <span className="text-[#6B7280]">|</span>
           <div className="flex items-center gap-2">
-            <span className="text-xl">🎓</span>
             <span className="font-semibold text-white">Laureate Application Screening</span>
           </div>
         </div>
@@ -465,8 +466,12 @@ export default function CaseDetailPage() {
               <div className="flex items-center gap-3 mb-4">
                 <div className="h-5 w-1 rounded-full bg-[#002855]" />
                 <h2 className="text-lg font-bold text-[#002855]">Evaluation Results</h2>
-                <span className="ml-auto text-xs text-[#6B7280] bg-white border border-[#E2E8F0] px-2.5 py-1 rounded-full">
-                  {screeningResult.flagged_or_verified === 'Flagged' ? '⚑ Flagged for Review' : '✓ Verified'}
+                <span className={`ml-auto text-xs px-2.5 py-1 rounded-full border ${
+                  screeningResult.flagged_or_verified === 'Flagged'
+                    ? 'bg-amber-50 border-amber-300 text-amber-800 font-semibold'
+                    : 'bg-emerald-50 border-emerald-300 text-emerald-800 font-semibold'
+                }`}>
+                  {screeningResult.flagged_or_verified === 'Flagged' ? 'Flagged for Review' : 'Verified'}
                 </span>
               </div>
               <AgentResultPanel result={screeningResult} auditTrail={auditTrail} />
@@ -507,7 +512,6 @@ export default function CaseDetailPage() {
 function ErrorBanner({ title, message, onRetry }) {
   return (
     <div className="rounded-xl border border-red-300 bg-red-50 p-4 flex items-start gap-3">
-      <span className="text-red-500 text-lg flex-shrink-0">✕</span>
       <div className="flex-1 min-w-0">
         <p className="text-sm font-semibold text-red-700">{title}</p>
         <p className="text-xs text-red-600 mt-0.5 whitespace-pre-line break-words font-mono">{message}</p>
@@ -620,5 +624,4 @@ function FinalDecisionBanner({ result, onBack, onRerun, loading }) {
     </div>
   );
 }
-
 

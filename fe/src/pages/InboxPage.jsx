@@ -220,7 +220,10 @@ export default function InboxPage() {
     return { hitlCases: hitl, applicantCases: applicants };
   }, [cases]);
 
-  const openHitl = (c) => navigate(`/hitl/${c.thread_id || c.student_id}`);
+  // HITL cases use the same case detail page as regular workflow cases —
+  // the evaluation results and the human-review action box render on one
+  // page (matches Karan's UX requirement: results first, action at bottom).
+  const openHitl = (c) => navigate(`/case/${c.student_id}`, { state: { mode: 'view' } });
   const openScreen = (c) => navigate(`/case/${c.student_id}`, { state: { mode: 'screen' } });
   const openView = (c) => navigate(`/case/${c.student_id}`, { state: { mode: 'view' } });
 

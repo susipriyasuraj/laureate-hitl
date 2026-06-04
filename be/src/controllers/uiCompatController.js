@@ -507,9 +507,11 @@ const toInboxCase = (job) => ({
   request_type: job.request_type || "New",
   case_status: resolveCaseStatus(job),
   application_status:
-    job.status === "COMPLETED" || job.status === "IN PROGRESS" || job.status === "HITL_PENDING"
-      ? resolveDecision(job)
-      : "Under Review",
+    job.status === "HITL_PENDING"
+      ? "Pending Human Review"
+      : job.status === "COMPLETED" || job.status === "IN PROGRESS"
+        ? resolveDecision(job)
+        : "Under Review",
   attachments: job.attachments || job.fileName || "Application file",
   is_human_review_ready:
     Boolean(job.isOffPlatformReview) ||
@@ -541,10 +543,16 @@ const toCaseInfo = (job) => ({
   applicant_name: resolveApplicantName(job),
   request_type: job.request_type || "New",
   screening_status: resolveScreeningStatus(job),
+  // For HITL cases, the application's lifecycle is "Pending Human Review" —
+  // not the agent's recommendation. Showing Agent 6's recommendation here
+  // confuses the reviewer ("Status: Process" reads like the case is already
+  // moving forward). Use resolveDecision only once the workflow completes.
   application_status:
-    job.status === "COMPLETED" || job.status === "IN PROGRESS" || job.status === "HITL_PENDING"
-      ? resolveDecision(job)
-      : "Under Review",
+    job.status === "HITL_PENDING"
+      ? "Pending Human Review"
+      : job.status === "COMPLETED" || job.status === "IN PROGRESS"
+        ? resolveDecision(job)
+        : "Under Review",
   attachments: job.attachments || job.fileName || "Application file",
 });
 
@@ -608,8 +616,14 @@ const toScreeningResult = (job) => {
     job_status: job.status || "NOT_STARTED",
     is_processing: isProcessing,
     decision: resolveDecision(job),
+    // Prefer the explicit job.flagged_or_verified set by buildHitlTaskFromWebhook
+    // (populated from DS's output during HITL dispatch) before falling back to
+    // post-workflow output keys or a status-based default.
     flagged_or_verified:
-      job.workflow_output_izvdziwj0 || job.workflow_output_akfo7j55t || (isCompleted ? "Flagged" : "In Progress"),
+      job.flagged_or_verified ||
+      job.workflow_output_izvdziwj0 ||
+      job.workflow_output_akfo7j55t ||
+      (isCompleted ? "Flagged" : "In Progress"),
     case_status: resolveCaseStatus(job),
     completeness_flags: completenessFlags,
     screening_flags: screeningFlags,
@@ -1140,6 +1154,12 @@ const runPrimaryWorkflowForStudent = async (studentId) => {
     `Screening for student ${studentId}`
   );
 
+  // Fresh screening run — do NOT carry over the seed Excel's decision /
+  // reason / case_status. Those are pre-screening defaults (often
+  // "Incomplete Application" / "Closed" from prior data) and showing them on
+  // a freshly-triggered case incorrectly tells the reviewer the result before
+  // the workflow has produced anything. Reset to in-progress defaults so the
+  // UI shows "Under Review" until the workflow updates them.
   createJob({
     jobId: String(jobExecutionId),
     isSecondaryWorkflowExecuted: false,
@@ -1150,9 +1170,10 @@ const runPrimaryWorkflowForStudent = async (studentId) => {
     request_type: existing.request_type,
     attachments: existing.attachments,
     email: existing.email,
-    decision: existing.decision,
-    reason: existing.reason,
-    case_status: existing.case_status,
+    decision: "Pending Review",
+    reason: "",
+    case_status: "Open",
+    application_status: "Under Review",
     studentId: String(studentId),
     groupId: existing.groupId || null,
     status: "IN PROGRESS",
