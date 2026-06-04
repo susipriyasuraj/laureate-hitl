@@ -192,7 +192,6 @@ const extractEvaluation = ({ payload, workflowMeta, dsOutputs }) => {
     flaggedOrVerified,
   };
 };
-
 const toDecisionToken = (decision) => {
   const v = String(decision || "")
     .trim()
@@ -297,7 +296,6 @@ export const buildHitlTaskFromWebhook = async (payload = {}) => {
     workflowMeta,
     dsOutputs: outputValues,
   });
-
   return {
     jobId: String(payload.execution_id),
     studentId: String(studentId),
