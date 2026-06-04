@@ -2,12 +2,17 @@ import axios from "axios";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { opusHitlWebhookSchema } from "../schemas/opusHitlWebhookSchema.js";
+import { buildWorkflowReviewMeta, getV2WorkflowObject } from "./opusWorkflowService.js";
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 addFormats(ajv);
 
 const validateIncomingWebhook = ajv.compile(opusHitlWebhookSchema);
 
+// OPUS dispatches use a mix of Python-style aliases ("str", "int", "bool") and the
+// canonical wire names from the integration guide ("string", "integer", "boolean").
+// We normalize for validation only — the type echoed back in the callback is the
+// dispatch's own allowed_types entry verbatim, so OPUS sees its own names.
 const TYPE_ALIASES = {
   str: "string",
   string: "string",
@@ -39,6 +44,153 @@ const readTyped = (source, key) => {
     return item.value;
   }
   return item;
+};
+
+// Pick the first non-empty value from multiple candidate keys. Lets us read
+// the review_node.value blob whether OPUS uses `inputs/outputs` (per the
+// integration guide) or `input/output` (observed in older dispatches).
+const firstObject = (...candidates) => {
+  for (const c of candidates) {
+    if (c && typeof c === "object" && !Array.isArray(c) && Object.keys(c).length > 0) {
+      return c;
+    }
+  }
+  // Fall back to first non-null even if empty, so callers still get an object.
+  for (const c of candidates) {
+    if (c && typeof c === "object" && !Array.isArray(c)) {
+      return c;
+    }
+  }
+  return {};
+};
+
+const firstString = (...candidates) => {
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim()) return c;
+  }
+  return "";
+};
+
+// Off-platform-review nodes can declare extra inputs (beyond the canonical
+// `review_node`) that are wired from sibling upstream nodes. The dispatched
+// payload contains these under random `workflow_input_*` keys; the workflow's
+// input_schema gives each one a friendly `display_name`. This map flips that
+// around so we can look values up by their friendly name.
+const buildReviewInputIndex = (workflowMeta, payloadInputs) => {
+  const schema = workflowMeta?.review_node?.input_schema || {};
+  const out = {}; // friendly_name -> raw value
+  for (const [key, typedValue] of Object.entries(payloadInputs || {})) {
+    if (key === "review_node") continue;
+    const friendly = schema[key]?.display_name || schema[key]?.variable_name || key;
+    const raw = typedValue && typeof typedValue === "object" && "value" in typedValue
+      ? typedValue.value
+      : typedValue;
+    out[friendly] = raw;
+  }
+  return out;
+};
+
+// Convert a value (often a string like "ID and personal details verified" or
+// "GPA above 3.0") into a uniform "<text> ✓" / "<text> ✗" the existing
+// AgentResultPanel renders into a pass/fail tile.
+const toFlagText = (value) => {
+  if (value === null || value === undefined || value === "") return "Not available ✗";
+  const text = String(value).trim();
+  if (!text) return "Not available ✗";
+  const lower = text.toLowerCase();
+  const passSignals = ["verified", "present", "selected", "above", "satisf", "eligible", "approve", "yes", "true", "pass", "ok"];
+  const failSignals = ["missing", "absent", "rejected", "denied", "below", "insuff", "fail", "no", "false", "incomplete"];
+  if (passSignals.some((s) => lower.includes(s))) return `${text} ✓`;
+  if (failSignals.some((s) => lower.includes(s))) return `${text} ✗`;
+  return `${text} ✓`;
+};
+
+const safeString = (v, fallback = "") => {
+  if (v === null || v === undefined) return fallback;
+  if (typeof v === "string") return v.trim() || fallback;
+  return String(v);
+};
+
+const parseListLoose = (v) => {
+  if (Array.isArray(v)) return v.map((s) => String(s).trim()).filter(Boolean);
+  if (!v) return [];
+  const text = String(v).trim();
+  if (!text) return [];
+  if (text.startsWith("[") && text.endsWith("]")) {
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return parsed.map((s) => String(s).trim()).filter(Boolean);
+    } catch {
+      /* fall through */
+    }
+  }
+  return text.split(/[;,\n]/).map((s) => s.trim()).filter(Boolean);
+};
+
+// Read a Document Screening output value out of the dispatch's
+// review_node.value.outputs. The dispatch wraps each value in {value, type},
+// or sometimes places the raw value directly under the key.
+const readDSOutput = (outputs, name) => {
+  const entry = outputs?.[name];
+  if (entry === null || entry === undefined) return null;
+  if (typeof entry === "object" && "value" in entry) return entry.value;
+  return entry;
+};
+
+// Build the evaluation bundle the FE renders on a HITL_PENDING case:
+//   - completeness_flags  (Agent 6's 5 document-check outputs)
+//   - screening_flags     (Document Screening's 4 rule-evaluation outputs)
+//   - agentDecision / agentReason / agentDeficiencyList / agentCaseStatus /
+//     agentApplicationStatus  (Agent 6's overall recommendation, surfaced to
+//     the human reviewer)
+//   - flaggedOrVerified   (DS's flagged_or_verified — used in DecisionSummary)
+//
+// All five fields are populated from the dispatch payload; no extra OPUS API
+// call is required. If a value isn't present (older workflow version, fields
+// not wired yet), the field is filled with "Not available" so the UI still
+// renders cleanly.
+const extractEvaluation = ({ payload, workflowMeta, dsOutputs }) => {
+  const inputsByFriendly = buildReviewInputIndex(workflowMeta, payload?.inputs);
+
+  // Agent 6 completeness checks — keyed by display_name (== Agent 6's
+  // variable_name, set by the workflow author when wiring the inputs).
+  const completenessFlags = {
+    "ID and Personal Details": toFlagText(inputsByFriendly["id_personal_details_check"]),
+    "Signature": toFlagText(inputsByFriendly["signature_check"]),
+    "Grade Sheets and Certificates": toFlagText(inputsByFriendly["grade_sheets_check"]),
+    "LOR Documents": toFlagText(inputsByFriendly["lor_check"]),
+    "Work Experience": toFlagText(inputsByFriendly["work_experience_check"]),
+  };
+
+  // Document Screening rule evaluations — DS produces both <rule>_result
+  // (descriptive text) and <rule>_flag (short status). Prefer the result text
+  // when present, fall back to the flag.
+  const dsRead = (resultKey, flagKey) =>
+    readDSOutput(dsOutputs, resultKey) ?? readDSOutput(dsOutputs, flagKey);
+  const screeningFlags = {
+    "GPA Rule": toFlagText(dsRead("gpa_result", "gpa_flag")),
+    "Work Experience Rule": toFlagText(dsRead("work_experience_result", "work_experience_flag")),
+    "LOR Institution Rule": toFlagText(dsRead("lor_university_result", "lor_university_flag")),
+    "LOR Recency Rule": toFlagText(dsRead("lor_date_result", "lor_date_flag")),
+  };
+
+  const agentDecision = safeString(inputsByFriendly["decision"], "");
+  const agentReason = safeString(inputsByFriendly["reason"], "");
+  const agentDeficiencyList = parseListLoose(inputsByFriendly["deficiency_list"]);
+  const agentCaseStatus = safeString(inputsByFriendly["case_status"], "");
+  const agentApplicationStatus = safeString(inputsByFriendly["application_status"], "");
+  const flaggedOrVerified = safeString(readDSOutput(dsOutputs, "flagged_or_verified"), "");
+
+  return {
+    completenessFlags,
+    screeningFlags,
+    agentDecision,
+    agentReason,
+    agentDeficiencyList,
+    agentCaseStatus,
+    agentApplicationStatus,
+    flaggedOrVerified,
+  };
 };
 
 const toDecisionToken = (decision) => {
@@ -86,10 +238,23 @@ export const validateHitlWebhookPayload = (payload = {}) => {
   return { ok: false, errors };
 };
 
-export const buildHitlTaskFromWebhook = (payload = {}) => {
+export const buildHitlTaskFromWebhook = async (payload = {}) => {
   const reviewValue = payload.inputs?.review_node?.value || {};
-  const inputValues = reviewValue.input || {};
-  const outputValues = reviewValue.output || {};
+
+  // Tolerate both OPUS payload shapes:
+  //  - Integration guide: { inputs, outputs, schema: {inputs, outputs}, node_id, process }
+  //  - Older / observed:  { input, output, input_schema, output_schema, node_execution_id }
+  // Also tolerate the degenerate case where `value` IS the upstream output dict.
+  const inputValues = firstObject(reviewValue.input, reviewValue.inputs);
+  const outputValues = firstObject(
+    reviewValue.output,
+    reviewValue.outputs,
+    // Degenerate case: a Code node's output dict lives directly under `value`.
+    Object.keys(inputValues).length === 0 ? reviewValue : null,
+  );
+  const inputSchema = firstObject(reviewValue.input_schema, reviewValue.schema?.inputs);
+  const outputSchema = firstObject(reviewValue.output_schema, reviewValue.schema?.outputs);
+  const nodeExecutionId = firstString(reviewValue.node_execution_id, reviewValue.node_id);
   const expectedSchema = payload.expected_output_schema || { schema: {} };
 
   const studentId =
@@ -104,14 +269,54 @@ export const buildHitlTaskFromWebhook = (payload = {}) => {
     readTyped(inputValues, "name") ||
     `Applicant ${studentId}`;
 
+  // Best-effort: enrich the job with workflow + upstream-node metadata fetched
+  // from the OPUS Reference Workflow API. Gives the FE display names for the
+  // dispatch's bare `variable_name` keys, the upstream node's name, etc.
+  // Falls back to null on any failure — the rest of the flow proceeds.
+  let workflowMeta = null;
+  try {
+    const workflowObj = await getV2WorkflowObject(payload.workflow_id);
+    workflowMeta = buildWorkflowReviewMeta(workflowObj);
+  } catch (e) {
+    // Logged inside getV2WorkflowObject; swallow here so dispatch always lands.
+  }
+
+  // Prefer the workflow's name from the API (richer) when the dispatch didn't
+  // carry workflow_name or carried the placeholder "Untitled Workflow".
+  const resolvedWorkflowName =
+    payload.workflow_name && payload.workflow_name !== "Untitled Workflow"
+      ? payload.workflow_name
+      : workflowMeta?.workflow_name || payload.workflow_name || "";
+
+  // Extract the upstream evaluation results so the FE can show them in the
+  // same Completeness / Screening / Decision-Summary cards it uses for
+  // post-workflow results — populated NOW (before the human submits) so the
+  // reviewer has full context.
+  const evaluation = extractEvaluation({
+    payload,
+    workflowMeta,
+    dsOutputs: outputValues,
+  });
+
   return {
     jobId: String(payload.execution_id),
     studentId: String(studentId),
     applicant_name: String(applicantName),
     request_type: "Off Platform Review",
-    case_status: "Open",
-    application_status: "Pending Review",
-    decision: "Pending Review",
+    // Surface Agent 6's case_status / application_status if provided, so the
+    // header banner reflects the workflow's current view. Falls back to
+    // sensible "in review" defaults when Agent 6 hasn't expressed an opinion.
+    case_status: evaluation.agentCaseStatus || "Open",
+    application_status: evaluation.agentApplicationStatus || "Pending Review",
+    // result.decision is rendered as "Agent Decision" in the existing summary
+    // card — use Agent 6's recommendation when present so the reviewer sees
+    // what the agent suggested before they make their own call.
+    decision: evaluation.agentDecision || "Pending Review",
+    reason: evaluation.agentReason || "",
+    deficiency_list: evaluation.agentDeficiencyList,
+    completeness_flags: evaluation.completenessFlags,
+    screening_flags: evaluation.screeningFlags,
+    flagged_or_verified: evaluation.flaggedOrVerified || (evaluation.agentDecision ? "Verified" : "In Progress"),
     status: "HITL_PENDING",
     isOffPlatformReview: true,
     available_actions: ["approve", "reject", "waitlist", "raise_insufficiency"],
@@ -123,14 +328,17 @@ export const buildHitlTaskFromWebhook = (payload = {}) => {
 
     hitlExecutionId: String(payload.execution_id),
     hitlWorkflowId: String(payload.workflow_id),
-    hitlWorkflowName: String(payload.workflow_name || ""),
-    hitlNodeExecutionId: String(reviewValue.node_execution_id || ""),
+    hitlWorkflowName: String(resolvedWorkflowName),
+    hitlNodeExecutionId: String(nodeExecutionId),
 
     hitlInputs: inputValues,
     hitlNodeOutput: outputValues,
-    hitlInputSchema: reviewValue.input_schema || {},
-    hitlNodeOutputSchema: reviewValue.output_schema || {},
+    hitlInputSchema: inputSchema,
+    hitlNodeOutputSchema: outputSchema,
     hitlProcess: reviewValue.process || {},
+
+    hitlWorkflowMeta: workflowMeta,
+    hitlEvaluation: evaluation,
 
     hitlCallback: {
       url: String(payload.callback?.url || ""),
@@ -337,16 +545,22 @@ export const buildAndValidateHitlOutput = ({
     return { ok: false, errors, outputByVarName: null, callbackOutput: null };
   }
 
+  // Build the callback's output_data — keyed by the schema's outer key (the
+  // variable_name / auto-id like "workflow_output_xyz"), with each value wrapped
+  // as {value, type} per integration guide §5.2. The `type` is passed through
+  // from the dispatch's own allowed_types[0] so OPUS sees its own type names
+  // back (e.g. "bool" not "boolean", matching what it sent).
   const callbackOutput = {};
-  for (const varDef of Object.values(schema)) {
-    const variableName = String(varDef?.variable_name || "");
-    const id = String(varDef?.id || "");
+  for (const [schemaKey, varDef] of Object.entries(schema)) {
+    const variableName = String(varDef?.variable_name || schemaKey);
     const value = outputByVarName[variableName];
+    const allowedTypes = Array.isArray(varDef?.allowed_types) ? varDef.allowed_types : [];
+    const dispatchedType = allowedTypes[0] || { type: "string", type_definition: null };
 
-    callbackOutput[variableName] = value;
-    if (id) {
-      callbackOutput[id] = value;
-    }
+    callbackOutput[schemaKey] = {
+      value,
+      type: dispatchedType,
+    };
   }
 
   return {
@@ -357,7 +571,7 @@ export const buildAndValidateHitlOutput = ({
   };
 };
 
-export const sendHitlCallback = async ({ callback, callbackOutput }) => {
+export const sendHitlCallback = async ({ callback, callbackOutput, status = "success", error = null }) => {
   const headerName = String(callback?.token_header || "").trim();
   const tokenValue = String(callback?.token || "").trim();
   const url = String(callback?.url || "").trim();
@@ -371,17 +585,28 @@ export const sendHitlCallback = async ({ callback, callbackOutput }) => {
     [headerName]: tokenValue,
   };
 
+  // Per integration guide §5.2:
+  //   { output_data: { <key>: { value, type } }, status: "success"|"failed", error? }
   const body = {
-    output: callbackOutput,
+    output_data: callbackOutput || {},
+    status,
   };
+  if (status === "failed" && error) {
+    body.error = String(error);
+  }
 
+  // Don't throw on non-2xx — let the caller surface the real status code to
+  // the reviewer (e.g. 401 = expired, 400 = validation, 404 = unknown execution).
   const response = await axios.post(url, body, {
     headers,
     timeout: 20000,
+    validateStatus: () => true,
   });
 
   return {
     status: response.status,
     data: response.data,
+    ok: response.status >= 200 && response.status < 300,
+    sentBody: body,
   };
 };

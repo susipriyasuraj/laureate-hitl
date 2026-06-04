@@ -507,14 +507,24 @@ const toInboxCase = (job) => ({
   request_type: job.request_type || "New",
   case_status: resolveCaseStatus(job),
   application_status:
-    job.status === "COMPLETED" || job.status === "IN PROGRESS" || job.status === "HITL_PENDING"
-      ? resolveDecision(job)
-      : "Under Review",
+    job.status === "HITL_PENDING"
+      ? "Pending Human Review"
+      : job.status === "COMPLETED" || job.status === "IN PROGRESS"
+        ? resolveDecision(job)
+        : "Under Review",
   attachments: job.attachments || job.fileName || "Application file",
   is_human_review_ready:
     Boolean(job.isOffPlatformReview) ||
     job.status === "HITL_PENDING" ||
     normalizeActions(job.available_actions).length > 0,
+  // Surface the HITL thread id (== OPUS execution id) so the FE can navigate
+  // straight to /hitl/:threadId for off-platform reviews instead of the
+  // legacy /case/:studentId screening detail page.
+  thread_id: Boolean(job.isOffPlatformReview) ? String(job.jobId || "") : null,
+  is_off_platform_review: Boolean(job.isOffPlatformReview),
+  hitl_workflow_name: job.hitlWorkflowName || null,
+  hitl_node_name: job.hitlWorkflowMeta?.review_node?.name || null,
+  submitted_at: job.submittedAt || null,
 });
 
 const resolveScreeningStatus = (job = {}) => {
@@ -533,10 +543,16 @@ const toCaseInfo = (job) => ({
   applicant_name: resolveApplicantName(job),
   request_type: job.request_type || "New",
   screening_status: resolveScreeningStatus(job),
+  // For HITL cases, the application's lifecycle is "Pending Human Review" —
+  // not the agent's recommendation. Showing Agent 6's recommendation here
+  // confuses the reviewer ("Status: Process" reads like the case is already
+  // moving forward). Use resolveDecision only once the workflow completes.
   application_status:
-    job.status === "COMPLETED" || job.status === "IN PROGRESS" || job.status === "HITL_PENDING"
-      ? resolveDecision(job)
-      : "Under Review",
+    job.status === "HITL_PENDING"
+      ? "Pending Human Review"
+      : job.status === "COMPLETED" || job.status === "IN PROGRESS"
+        ? resolveDecision(job)
+        : "Under Review",
   attachments: job.attachments || job.fileName || "Application file",
 });
 
@@ -600,8 +616,14 @@ const toScreeningResult = (job) => {
     job_status: job.status || "NOT_STARTED",
     is_processing: isProcessing,
     decision: resolveDecision(job),
+    // Prefer the explicit job.flagged_or_verified set by buildHitlTaskFromWebhook
+    // (populated from DS's output during HITL dispatch) before falling back to
+    // post-workflow output keys or a status-based default.
     flagged_or_verified:
-      job.workflow_output_izvdziwj0 || job.workflow_output_akfo7j55t || (isCompleted ? "Flagged" : "In Progress"),
+      job.flagged_or_verified ||
+      job.workflow_output_izvdziwj0 ||
+      job.workflow_output_akfo7j55t ||
+      (isCompleted ? "Flagged" : "In Progress"),
     case_status: resolveCaseStatus(job),
     completeness_flags: completenessFlags,
     screening_flags: screeningFlags,
@@ -1132,6 +1154,12 @@ const runPrimaryWorkflowForStudent = async (studentId) => {
     `Screening for student ${studentId}`
   );
 
+  // Fresh screening run — do NOT carry over the seed Excel's decision /
+  // reason / case_status. Those are pre-screening defaults (often
+  // "Incomplete Application" / "Closed" from prior data) and showing them on
+  // a freshly-triggered case incorrectly tells the reviewer the result before
+  // the workflow has produced anything. Reset to in-progress defaults so the
+  // UI shows "Under Review" until the workflow updates them.
   createJob({
     jobId: String(jobExecutionId),
     isSecondaryWorkflowExecuted: false,
@@ -1142,9 +1170,10 @@ const runPrimaryWorkflowForStudent = async (studentId) => {
     request_type: existing.request_type,
     attachments: existing.attachments,
     email: existing.email,
-    decision: existing.decision,
-    reason: existing.reason,
-    case_status: existing.case_status,
+    decision: "Pending Review",
+    reason: "",
+    case_status: "Open",
+    application_status: "Under Review",
     studentId: String(studentId),
     groupId: existing.groupId || null,
     status: "IN PROGRESS",
@@ -1384,7 +1413,8 @@ export const offPlatformReviewWebhookController = async (req, res) => {
         });
       }
 
-      const task = buildHitlTaskFromWebhook(payload);
+      // Async: enrichment fetches workflow definition from OPUS for display labels.
+      const task = await buildHitlTaskFromWebhook(payload);
       const existing = getAllJobs().find(
         (item) => String(item.jobId || "") === String(task.jobId)
       );
@@ -1487,10 +1517,31 @@ export const getOffPlatformReviewDetailController = async (req, res) => {
       case_status: resolveCaseStatus(job),
       decision: resolveDecision(job),
       available_actions: normalizeActions(job.available_actions),
+      submitted_at: job.submittedAt || null,
+
+      // Raw upstream-node data from the dispatch (what the reviewer needs to judge).
       input_context: job.hitlInputs || {},
       node_output: job.hitlNodeOutput || {},
+      input_schema: job.hitlInputSchema || {},
+      node_output_schema: job.hitlNodeOutputSchema || {},
+      process: job.hitlProcess || {},
+
+      // Workflow + node metadata fetched from the OPUS Reference Workflow API.
+      // Provides display names + descriptions so the FE can render labels
+      // instead of bare variable_name keys. May be null if the fetch failed.
+      workflow_meta: job.hitlWorkflowMeta || null,
+
+      // Reviewer-facing schema for the form widgets to render.
       expected_output_schema: job.hitlExpectedOutputSchema || null,
+
       hitl_status: String(job.hitlStatus || "PENDING"),
+
+      // Last callback attempt — present after the reviewer has submitted at
+      // least once. Used to surface OPUS errors and show the request preview.
+      last_callback_status: job.hitlLastCallbackStatus || null,
+      last_callback_response: job.hitlLastCallbackResponseBody || null,
+      last_callback_payload: job.hitlLastCallbackPayload || null,
+
       audit_log: Array.isArray(job.hitlAuditLog) ? job.hitlAuditLog : [],
     });
   } catch (error) {
@@ -1576,9 +1627,14 @@ export const submitHumanDecisionController = async (req, res) => {
         });
       }
 
+      // The reviewer's decision (approve/reject/etc.) is a business outcome encoded
+      // in output_data. The callback's `status` reflects whether the review itself
+      // succeeded as a technical handshake — always "success" here unless the action
+      // explicitly signals an inability to complete.
       const callbackResult = await sendHitlCallback({
         callback: job.hitlCallback,
         callbackOutput: validation.callbackOutput,
+        status: "success",
       });
 
       const updatedHitlAudit = [
@@ -1590,23 +1646,48 @@ export const submitHumanDecisionController = async (req, res) => {
           reviewer_output: reviewerOutput,
           callback_output: validation.callbackOutput,
           callback_status: callbackResult.status,
+          callback_ok: callbackResult.ok,
         },
       ];
 
+      const hitlStatus = callbackResult.ok ? "SUBMITTED" : "CALLBACK_FAILED";
+
       const updated = updateJobResult(threadId, {
-        decision: mapped.decision,
-        application_status: mapped.application_status,
-        case_status: mapped.case_status,
-        workflow_output_p1e47k0wq: mapped.application_status,
-        workflow_output_i7abcyo03: mapped.application_status,
-        available_actions: [],
-        hitlStatus: "SUBMITTED",
+        // Only mark the decision as final if OPUS accepted the callback. If OPUS
+        // rejected it, the workflow is still paused — surfacing the decision as
+        // final in our UI would mislead the reviewer into thinking it stuck.
+        ...(callbackResult.ok
+          ? {
+              decision: mapped.decision,
+              application_status: mapped.application_status,
+              case_status: mapped.case_status,
+              workflow_output_p1e47k0wq: mapped.application_status,
+              workflow_output_i7abcyo03: mapped.application_status,
+              available_actions: [],
+            }
+          : {}),
+        hitlStatus,
         hitlLastOutput: validation.outputByVarName,
-        hitlLastCallbackPayload: { output: validation.callbackOutput },
+        hitlLastCallbackPayload: callbackResult.sentBody,
         hitlLastCallbackStatus: callbackResult.status,
+        hitlLastCallbackResponseBody: callbackResult.data,
         hitlAuditLog: updatedHitlAudit,
         offPlatformDecisionSubmittedAt: new Date().toISOString(),
       });
+
+      if (!callbackResult.ok) {
+        // Surface OPUS's status code and body so the FE can render a meaningful
+        // message ("review expired" for 401, "validation failed" for 400, etc.)
+        // instead of a generic 500.
+        return res.status(502).json({
+          detail: "OPUS rejected the callback",
+          opus_status: callbackResult.status,
+          opus_body: callbackResult.data,
+          sent_body: callbackResult.sentBody,
+          thread_id: threadId,
+          hitl_status: hitlStatus,
+        });
+      }
 
       return res.status(200).json({
         decision: mapped.decision,

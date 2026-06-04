@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
+import SchemaDrivenReviewForm from './SchemaDrivenReviewForm';
 
 /* ── Button config per action type ── */
 const BUTTON_CONFIG = {
@@ -62,21 +63,39 @@ function inferButtons(agentDecision) {
   return ['approve', 'raise'];
 }
 
-export default function HumanReviewPanel({ agentDecision, availableActions, onDecision, loading }) {
-  const [outputJson, setOutputJson] = useState('');
-  const [jsonError, setJsonError] = useState('');
+export default function HumanReviewPanel({
+  agentDecision,
+  availableActions,
+  onDecision,
+  loading,
+  expectedOutputSchema,
+}) {
+  // Schema-driven mode: render a typed form per output variable.
+  // Fallback mode: free-form JSON textarea (kept for off-platform tasks that
+  // arrive without a schema, e.g. legacy synthetic jobs).
+  const hasSchema =
+    expectedOutputSchema &&
+    typeof expectedOutputSchema === 'object' &&
+    Object.keys(expectedOutputSchema).length > 0;
+
+  const [formState, setFormState] = useState({ values: {}, errors: {}, isValid: true });
+  const [fallbackJson, setFallbackJson] = useState('');
+  const [submitError, setSubmitError] = useState('');
 
   const buttons = availableActions?.length
     ? availableActions.map(mapAction)
     : inferButtons(agentDecision);
 
-  const parsedOutput = useMemo(() => {
-    if (!outputJson.trim()) {
-      return null;
-    }
+  const handleSchemaChange = useCallback((next) => {
+    setFormState(next);
+  }, []);
 
+  const fallbackParsed = useMemo(() => {
+    if (hasSchema) return null;
+    const trimmed = fallbackJson.trim();
+    if (!trimmed) return null;
     try {
-      const parsed = JSON.parse(outputJson);
+      const parsed = JSON.parse(trimmed);
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         return { __invalid: 'Reviewer output must be a JSON object.' };
       }
@@ -84,16 +103,28 @@ export default function HumanReviewPanel({ agentDecision, availableActions, onDe
     } catch {
       return { __invalid: 'Reviewer output is not valid JSON.' };
     }
-  }, [outputJson]);
+  }, [fallbackJson, hasSchema]);
 
   const handleDecisionClick = (type) => {
-    if (parsedOutput?.__invalid) {
-      setJsonError(parsedOutput.__invalid);
+    setSubmitError('');
+
+    if (hasSchema) {
+      if (!formState.isValid) {
+        const errCount = Object.keys(formState.errors).length;
+        setSubmitError(
+          `Fix ${errCount} field${errCount === 1 ? '' : 's'} before submitting.`
+        );
+        return;
+      }
+      onDecision(type, formState.values);
       return;
     }
 
-    setJsonError('');
-    onDecision(type, parsedOutput);
+    if (fallbackParsed?.__invalid) {
+      setSubmitError(fallbackParsed.__invalid);
+      return;
+    }
+    onDecision(type, fallbackParsed);
   };
 
   return (
@@ -107,38 +138,54 @@ export default function HumanReviewPanel({ agentDecision, availableActions, onDe
         </div>
         <div>
           <h2 className="text-sm font-bold text-white">Human Review Required</h2>
-          <p className="text-xs text-[#93c5fd] mt-0.5">Review the agent analysis above and submit your decision</p>
+          <p className="text-xs text-[#93c5fd] mt-0.5">
+            {hasSchema
+              ? `Fill ${Object.keys(expectedOutputSchema).length} output field${
+                  Object.keys(expectedOutputSchema).length === 1 ? '' : 's'
+                } and pick a decision`
+              : 'Review the agent analysis above and submit your decision'}
+          </p>
         </div>
       </div>
 
-      <div className="px-6 pt-6">
-        <label htmlFor="reviewer-output-json" className="block text-xs font-semibold text-[#475569] uppercase tracking-wider mb-2">
-          Reviewer Output (Optional JSON)
-        </label>
-        <textarea
-          id="reviewer-output-json"
-          value={outputJson}
-          onChange={(event) => {
-            setOutputJson(event.target.value);
-            if (jsonError) {
-              setJsonError('');
-            }
-          }}
-          placeholder='{"workflow_output_final_decision":"approve","workflow_output_approved_amount":250000}'
-          className="w-full min-h-[96px] rounded-lg border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A] focus:outline-none focus:ring-2 focus:ring-[#1D4ED8]/30 focus:border-[#1D4ED8]"
-        />
-        <p className="text-[11px] text-[#64748B] mt-1.5">
-          Send corrections mapped by expected output variable_name or schema id.
-        </p>
-        {jsonError && (
-          <p className="text-xs text-[#CC0000] mt-2">{jsonError}</p>
+      {/* Form area */}
+      <div className="px-6 pt-6 pb-2">
+        {hasSchema ? (
+          <SchemaDrivenReviewForm schema={expectedOutputSchema} onChange={handleSchemaChange} />
+        ) : (
+          <>
+            <label
+              htmlFor="reviewer-output-json"
+              className="block text-xs font-semibold text-[#475569] uppercase tracking-wider mb-2"
+            >
+              Reviewer Output (Optional JSON)
+            </label>
+            <textarea
+              id="reviewer-output-json"
+              value={fallbackJson}
+              onChange={(event) => {
+                setFallbackJson(event.target.value);
+                if (submitError) setSubmitError('');
+              }}
+              placeholder='{"workflow_output_final_decision":"approve","workflow_output_approved_amount":250000}'
+              className="w-full min-h-[96px] rounded-lg border border-[#CBD5E1] px-3 py-2 text-xs font-mono text-[#0F172A] focus:outline-none focus:ring-2 focus:ring-[#1D4ED8]/30 focus:border-[#1D4ED8]"
+            />
+            <p className="text-[11px] text-[#64748B] mt-1.5">
+              Send corrections mapped by expected output variable_name or schema id.
+            </p>
+          </>
+        )}
+
+        {submitError && (
+          <p className="text-xs text-[#CC0000] mt-2 font-medium">{submitError}</p>
         )}
       </div>
 
       {/* Actions */}
       <div className="p-6 flex flex-col sm:flex-row gap-4">
-        {buttons.map(type => {
+        {buttons.map((type) => {
           const cfg = BUTTON_CONFIG[type];
+          if (!cfg) return null;
           const isActive = loading === type;
           return (
             <button
@@ -173,4 +220,3 @@ export default function HumanReviewPanel({ agentDecision, availableActions, onDe
     </div>
   );
 }
-

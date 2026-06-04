@@ -21,37 +21,12 @@ export const opusHitlWebhookSchema = {
           type: "object",
           required: ["value"],
           properties: {
-            value: {
-              type: "object",
-              required: [
-                "input_schema",
-                "output_schema",
-                "input",
-                "output",
-                "node_execution_id",
-              ],
-              properties: {
-                input_schema: {
-                  type: "object",
-                  additionalProperties: { $ref: "#/$defs/variableDef" },
-                },
-                output_schema: {
-                  type: "object",
-                  additionalProperties: { $ref: "#/$defs/variableDef" },
-                },
-                input: {
-                  type: "object",
-                  additionalProperties: { $ref: "#/$defs/typedValue" },
-                },
-                output: {
-                  type: "object",
-                  additionalProperties: { $ref: "#/$defs/typedValue" },
-                },
-                process: { type: "object" },
-                node_execution_id: { type: "string", minLength: 1 },
-              },
-              additionalProperties: true,
-            },
+            // `value` shape varies by OPUS version + upstream node type:
+            //   - Integration guide (canonical): { node_id, node_type, inputs, outputs, process, schema: {inputs, outputs} }
+            //   - Older / observed:              { node_execution_id, input, output, input_schema, output_schema, process }
+            //   - Degenerate (code-node demo):   the upstream node's output dict directly
+            // We accept any object here; buildHitlTaskFromWebhook is tolerant of all three.
+            value: { type: "object", additionalProperties: true },
             type: { type: "object" },
           },
           additionalProperties: true,
@@ -107,17 +82,6 @@ export const opusHitlWebhookSchema = {
             additionalProperties: true,
           },
         },
-      },
-      additionalProperties: true,
-    },
-    typedValue: {
-      type: "object",
-      required: ["value"],
-      properties: {
-        value: {},
-        type: { type: "object" },
-        status: { type: ["string", "null"] },
-        compliance: { type: ["string", "null"] },
       },
       additionalProperties: true,
     },
