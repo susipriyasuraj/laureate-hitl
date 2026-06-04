@@ -70,17 +70,45 @@ export const getV2WorkflowObject = async (workflowId) => {
  * Locate the off-platform review node within a workflow.
  *
  * Identification: handler_class === "human_task" AND properties includes "review".
- * Workflows with multiple review nodes return the first match; the caller can
- * cross-reference against an execution payload if disambiguation is needed.
+ *
+ * Disambiguation when multiple review nodes exist:
+ * Prefer the one whose outputs are consumed by at least one downstream node
+ * — this is the node actually wired into the workflow's execution path. A
+ * dangling testing-only HITL node (no downstream consumers) is skipped.
+ *
+ * If no review node has downstream consumers (rare — only happens when the
+ * workflow is mid-construction) we fall back to the first match.
  */
+const countDownstreamConsumers = (workflowObj, nodeId) => {
+  let n = 0;
+  for (const node of Object.values(workflowObj?.nodes || {})) {
+    if (node.id === nodeId) continue;
+    for (const mapping of Object.values(node.mappings || {})) {
+      if (mapping?.origin_id === nodeId) {
+        n += 1;
+      }
+    }
+  }
+  return n;
+};
+
 export const findOffPlatformReviewNode = (workflowObj) => {
   if (!workflowObj?.nodes) return null;
-  for (const node of Object.values(workflowObj.nodes)) {
+  const candidates = Object.values(workflowObj.nodes).filter((node) => {
     const isHumanTask = node?.handler_class === "human_task";
     const isReview = Array.isArray(node?.properties) && node.properties.includes("review");
-    if (isHumanTask && isReview) return node;
-  }
-  return null;
+    return isHumanTask && isReview;
+  });
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+
+  // Multiple review nodes — pick the one actually in the execution path.
+  const withConsumerCounts = candidates.map((n) => ({
+    node: n,
+    consumers: countDownstreamConsumers(workflowObj, n.id),
+  }));
+  withConsumerCounts.sort((a, b) => b.consumers - a.consumers);
+  return withConsumerCounts[0].node;
 };
 
 /**
@@ -111,7 +139,50 @@ const slimNode = (node) => {
     type: node.type || node.handler_class || "",
     input_schema: node.input_schema?.schema || {},
     output_schema: node.output_schema?.schema || {},
+    mappings: node.mappings || {},
   };
+};
+
+/**
+ * For each non-`review_node` input on the off-platform review node, resolve
+ * the canonical source variable name by following the input's mapping back
+ * to its upstream node's output_schema.
+ *
+ * This makes the BE robust against the workflow author renaming or mistyping
+ * the display_name on the review-node input — we identify what each value IS
+ * by what upstream output it came from, not by whatever label the author
+ * typed. Different workflow authors may name the same Agent-6 output input
+ * "id_personal_details_check" or "id_proof_and_personal_details_check"; both
+ * resolve to the same canonical source variable_name.
+ *
+ * Returns: { <off-platform-input-key>: { source_variable_name, source_node_id,
+ *                                         source_node_name, source_variable_path } }
+ */
+const buildSiblingInputIndex = (workflowObj, reviewNode) => {
+  if (!workflowObj || !reviewNode) return {};
+  const index = {};
+  for (const [inputKey, mapping] of Object.entries(reviewNode.mappings || {})) {
+    if (inputKey === "review_node") continue;
+    const originId = mapping?.origin_id;
+    const variablePath = mapping?.variable_path;
+    if (!originId || !variablePath) continue;
+    const sourceNode = workflowObj.nodes?.[originId];
+    if (!sourceNode) continue;
+    const sourceVarDef = sourceNode.output_schema?.schema?.[variablePath];
+    if (!sourceVarDef) continue;
+    // In V2 workflows, `variable_name` is the auto-generated "workflow_output_xxxx"
+    // id while `display_name` is the friendly label the workflow author typed
+    // (e.g. "id_proof_and_personal_details_check"). The friendly name is the
+    // semantic anchor — auto-ids change every time the workflow is rebuilt.
+    index[inputKey] = {
+      source_variable_name:
+        sourceVarDef.display_name || sourceVarDef.variable_name || variablePath,
+      source_variable_path: variablePath,
+      source_node_id: originId,
+      source_node_name: sourceNode.name || "",
+    };
+  }
+  return index;
 };
 
 /**
@@ -122,6 +193,7 @@ export const buildWorkflowReviewMeta = (workflowObj) => {
   if (!workflowObj) return null;
   const reviewNode = findOffPlatformReviewNode(workflowObj);
   const upstreamNode = findUpstreamNodeOf(workflowObj, reviewNode);
+  const siblingInputs = buildSiblingInputIndex(workflowObj, reviewNode);
 
   return {
     workflow_id: workflowObj.workflow_id || workflowObj.id || "",
@@ -130,6 +202,12 @@ export const buildWorkflowReviewMeta = (workflowObj) => {
     workflow_description: workflowObj.description || "",
     review_node: slimNode(reviewNode),
     upstream_node: slimNode(upstreamNode),
+    // Canonical source-of-truth map for each non-review_node input on the
+    // off-platform review: resolved to the upstream node's variable_name
+    // (e.g. Agent 6's "id_proof_and_personal_details_check"). The BE uses
+    // this to match dispatched values regardless of what display_name the
+    // workflow author typed on the review-node input.
+    sibling_inputs: siblingInputs,
   };
 };
 
