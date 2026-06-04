@@ -76,18 +76,58 @@ const firstString = (...candidates) => {
 // payload contains these under random `workflow_input_*` keys; the workflow's
 // input_schema gives each one a friendly `display_name`. This map flips that
 // around so we can look values up by their friendly name.
+// Index the dispatched non-`review_node` inputs by THREE keys so downstream
+// matching is robust no matter how the workflow author labelled things on
+// the review node:
+//
+//   1. Canonical source variable_name from workflow_meta.sibling_inputs
+//      (e.g. Agent 6's "id_proof_and_personal_details_check") — strongest
+//      key, survives display_name renames and typos.
+//   2. The review-node input's display_name (workflow_meta.review_node.input_schema)
+//      — works when the author wired and labelled them consistently.
+//   3. The raw dispatch key (e.g. "workflow_input_pcmb1pswv") — last resort.
+//
+// All three point at the same raw value; the caller can ask by whichever key
+// it prefers via `lookup(byCanonical, byDisplay, byKey)` semantics.
 const buildReviewInputIndex = (workflowMeta, payloadInputs) => {
-  const schema = workflowMeta?.review_node?.input_schema || {};
-  const out = {}; // friendly_name -> raw value
+  const reviewInputSchema = workflowMeta?.review_node?.input_schema || {};
+  const siblings = workflowMeta?.sibling_inputs || {};
+  const byCanonical = {}; // upstream-variable_name -> value
+  const byDisplay = {};   // review-node display_name -> value
+  const byKey = {};       // raw dispatch key -> value
+
   for (const [key, typedValue] of Object.entries(payloadInputs || {})) {
     if (key === "review_node") continue;
-    const friendly = schema[key]?.display_name || schema[key]?.variable_name || key;
     const raw = typedValue && typeof typedValue === "object" && "value" in typedValue
       ? typedValue.value
       : typedValue;
-    out[friendly] = raw;
+
+    byKey[key] = raw;
+
+    const display = reviewInputSchema[key]?.display_name;
+    if (display) byDisplay[display] = raw;
+
+    const canonical = siblings[key]?.source_variable_name;
+    if (canonical) byCanonical[canonical] = raw;
   }
-  return out;
+
+  return { byCanonical, byDisplay, byKey };
+};
+
+// Pull a value out of the index by trying canonical name first, then any
+// display name aliases, then any raw-key aliases. Returns undefined if no
+// match.
+const lookupInput = (index, { canonical, displays = [], keys = [] }) => {
+  if (canonical && index.byCanonical[canonical] !== undefined) {
+    return index.byCanonical[canonical];
+  }
+  for (const d of displays) {
+    if (index.byDisplay[d] !== undefined) return index.byDisplay[d];
+  }
+  for (const k of keys) {
+    if (index.byKey[k] !== undefined) return index.byKey[k];
+  }
+  return undefined;
 };
 
 // Convert a value (often a string like "ID and personal details verified" or
@@ -137,6 +177,36 @@ const readDSOutput = (outputs, name) => {
   return entry;
 };
 
+// In real OPUS dispatches, review_node.value.outputs is keyed by the upstream
+// node's auto-ids ("workflow_output_xyz123") — not by the friendly variable
+// name the author typed in the builder ("gpa_result"). Translate via the
+// upstream node's output_schema (in workflow_meta) so we can keep our match
+// logic readable using friendly names.
+//
+// Returns: { friendly_name: value } where the friendly_name is the upstream
+// node's output display_name (e.g. "gpa_result", "flagged_or_verified").
+const buildDsOutputsByFriendlyName = (workflowMeta, dsOutputs) => {
+  const out = {};
+  if (!dsOutputs) return out;
+  const upstreamSchema = workflowMeta?.upstream_node?.output_schema || {};
+
+  for (const [key, entry] of Object.entries(dsOutputs)) {
+    const value = entry && typeof entry === "object" && "value" in entry
+      ? entry.value
+      : entry;
+
+    // Index by the raw dispatch key too (covers smoke tests that pre-map).
+    out[key] = value;
+
+    // And by the display_name (the upstream author-chosen friendly name).
+    const def = upstreamSchema[key];
+    if (def?.display_name) out[def.display_name] = value;
+    if (def?.variable_name) out[def.variable_name] = value;
+  }
+
+  return out;
+};
+
 // Build the evaluation bundle the FE renders on a HITL_PENDING case:
 //   - completeness_flags  (Agent 6's 5 document-check outputs)
 //   - screening_flags     (Document Screening's 4 rule-evaluation outputs)
@@ -150,23 +220,47 @@ const readDSOutput = (outputs, name) => {
 // not wired yet), the field is filled with "Not available" so the UI still
 // renders cleanly.
 const extractEvaluation = ({ payload, workflowMeta, dsOutputs }) => {
-  const inputsByFriendly = buildReviewInputIndex(workflowMeta, payload?.inputs);
+  const idx = buildReviewInputIndex(workflowMeta, payload?.inputs);
 
-  // Agent 6 completeness checks — keyed by display_name (== Agent 6's
-  // variable_name, set by the workflow author when wiring the inputs).
+  // Look up an Agent-6-produced value by:
+  //   - canonical:   Agent 6's variable_name (single source of truth)
+  //   - displays:    common display_name variants different authors might pick
+  // The canonical key resolves via workflow_meta.sibling_inputs which traces
+  // each dispatched input back to its upstream node's output_schema variable_name.
+  const get = (canonical, ...displays) =>
+    lookupInput(idx, { canonical, displays });
+
+  // Agent 6 completeness checks. Canonical names are Agent 6's actual
+  // output variable_names from its output_schema; the display variants cover
+  // common rewordings authors use when wiring the review-node inputs.
   const completenessFlags = {
-    "ID and Personal Details": toFlagText(inputsByFriendly["id_personal_details_check"]),
-    "Signature": toFlagText(inputsByFriendly["signature_check"]),
-    "Grade Sheets and Certificates": toFlagText(inputsByFriendly["grade_sheets_check"]),
-    "LOR Documents": toFlagText(inputsByFriendly["lor_check"]),
-    "Work Experience": toFlagText(inputsByFriendly["work_experience_check"]),
+    "ID and Personal Details": toFlagText(
+      get("id_proof_and_personal_details_check", "id_personal_details_check", "id_check"),
+    ),
+    "Signature": toFlagText(get("signature_check")),
+    "Grade Sheets and Certificates": toFlagText(
+      get("grade_sheets_check", "grade_sheet_check", "gradesheets_check"),
+    ),
+    "LOR Documents": toFlagText(get("lor_check", "lor_documents_check")),
+    "Work Experience": toFlagText(get("work_experience_check", "workex_check")),
   };
 
   // Document Screening rule evaluations — DS produces both <rule>_result
   // (descriptive text) and <rule>_flag (short status). Prefer the result text
   // when present, fall back to the flag.
-  const dsRead = (resultKey, flagKey) =>
-    readDSOutput(dsOutputs, resultKey) ?? readDSOutput(dsOutputs, flagKey);
+  //
+  // Real OPUS dispatches key these by auto-id (workflow_output_xyz); we
+  // translate to friendly names via the upstream-node output_schema so the
+  // lookup names stay readable here.
+  const dsByName = buildDsOutputsByFriendlyName(workflowMeta, dsOutputs);
+  const dsRead = (...names) => {
+    for (const n of names) {
+      if (dsByName[n] !== undefined && dsByName[n] !== null && dsByName[n] !== "") {
+        return dsByName[n];
+      }
+    }
+    return null;
+  };
   const screeningFlags = {
     "GPA Rule": toFlagText(dsRead("gpa_result", "gpa_flag")),
     "Work Experience Rule": toFlagText(dsRead("work_experience_result", "work_experience_flag")),
@@ -174,12 +268,14 @@ const extractEvaluation = ({ payload, workflowMeta, dsOutputs }) => {
     "LOR Recency Rule": toFlagText(dsRead("lor_date_result", "lor_date_flag")),
   };
 
-  const agentDecision = safeString(inputsByFriendly["decision"], "");
-  const agentReason = safeString(inputsByFriendly["reason"], "");
-  const agentDeficiencyList = parseListLoose(inputsByFriendly["deficiency_list"]);
-  const agentCaseStatus = safeString(inputsByFriendly["case_status"], "");
-  const agentApplicationStatus = safeString(inputsByFriendly["application_status"], "");
-  const flaggedOrVerified = safeString(readDSOutput(dsOutputs, "flagged_or_verified"), "");
+  const agentDecision = safeString(get("decision"), "");
+  const agentReason = safeString(get("reason"), "");
+  const agentDeficiencyList = parseListLoose(get("deficiency_list"));
+  const agentCaseStatus = safeString(get("case_status"), "");
+  const agentApplicationStatus = safeString(get("application_status"), "");
+  // Same friendly-name lookup as the rule cards — DS sends flagged_or_verified
+  // either by raw key or by display_name depending on dispatch shape.
+  const flaggedOrVerified = safeString(dsRead("flagged_or_verified"), "");
 
   return {
     completenessFlags,
