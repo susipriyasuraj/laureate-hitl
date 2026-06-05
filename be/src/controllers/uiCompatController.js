@@ -21,12 +21,17 @@ import {
 } from "../services/jobStore.js";
 import {
   executeJob,
+  getJobAudit,
   getPresignedUrl,
   getJobResult,
   getJobStatus,
   getWorkflowSchema,
   initiateJob,
 } from "../services/opusApiService.js";
+import {
+  getV2WorkflowObject,
+  resolveNodeOutputsByDisplayName,
+} from "../services/opusWorkflowService.js";
 import {
   buildAndValidateHitlOutput,
   buildHitlTaskFromWebhook,
@@ -456,21 +461,295 @@ const deriveReviewFlags = (payload = {}) => {
   };
 };
 
-const isPassSignal = (value = "") => {
+// ─── Audit-driven flag extraction ────────────────────────────────────────────
+
+/**
+ * Maps Agent 6 output_schema display_name values to the UI card labels shown
+ * in the Document Completeness Check panel.
+ */
+const AGENT6_LABEL_MAP = {
+  id_proof_and_personal_details_check: "ID and Personal Details",
+  signature_check: "Signature",
+  grade_sheets_check: "Grade Sheets and Certificates",
+  lor_check: "LOR Documents",
+  work_experience_check: "Work Experience",
+};
+
+/**
+ * Maps Document Screening output_schema display_name values to UI card labels
+ * shown in the Screening Rules Evaluation panel.
+ */
+const DOC_SCREENING_LABEL_MAP = {
+  gpa_result: "GPA Rule",
+  work_experience_result: "Work Experience Rule",
+  lor_university_result: "LOR Institution Rule",
+  lor_date_result: "LOR Recency Rule",
+};
+
+/**
+ * Agent 6 display_name values that are summary/metadata fields, not
+ * completeness flag rows.  We persist them separately on the job record.
+ */
+const AGENT6_SUMMARY_DISPLAY_NAMES = new Set([
+  "decision",
+  "reason",
+  "case_status",
+  "application_status",
+  "deficiency_list",
+]);
+
+/** Agent-name substrings used to identify nodes when scanning audit entries. */
+const AGENT6_NAME_TOKENS = ["agent 6", "agent6"];
+const DOC_SCREENING_NAME_TOKENS = ["document screening", "doc screening"];
+
+/**
+ * Detect explicit fail language in a free-text audit value.
+ * Returns true when the text contains unambiguous failure terms.
+ * Defaults to PASS when none are found, per the design spec.
+ */
+const isFailSignal = (value = "") => {
   const v = String(value).toLowerCase();
   return (
-    v.includes("present") ||
-    v.includes("verified") ||
-    v.includes("selected") ||
-    v.includes("above") ||
-    v.includes("satisf") ||
-    v.includes("eligible")
+    v.includes("missing") ||
+    v.includes("below") ||
+    v.includes("insufficient") ||
+    v.includes("incomplete") ||
+    v.includes("skipped") ||
+    v.includes("fail") ||
+    v.includes("not found") ||
+    v.includes("no usable") ||
+    v.includes("unable to") ||
+    v.includes("not available") ||
+    v.includes("not present") ||
+    v.includes("absent")
   );
 };
 
 const toUiFlagValue = (value) => {
   const text = String(value || "Not available").trim();
-  return `${text} ${isPassSignal(text) ? "✓" : "✗"}`;
+  return `${text} ${isFailSignal(text) ? "✗" : "✓"}`;
+};
+
+/**
+ * Normalise an OPUS audit response into a flat array of node execution entries
+ * regardless of whether the API returns an array at root or an object with an
+ * executed_nodes / result / audit field.
+ */
+const normalizeAuditData = (auditData) => {
+  if (!auditData) return [];
+  if (Array.isArray(auditData)) return auditData;
+  if (Array.isArray(auditData.executed_nodes)) return auditData.executed_nodes;
+  if (Array.isArray(auditData.result)) return auditData.result;
+  if (Array.isArray(auditData.audit)) return auditData.audit;
+  if (Array.isArray(auditData.steps)) return auditData.steps;
+  return [];
+};
+
+/** Extract the node name from an audit entry, normalised to lower-case. */
+const getAuditEntryNodeName = (entry) =>
+  String(
+    entry?.node_name ||
+    entry?.agent_name ||
+    entry?.name ||
+    entry?.step_name ||
+    entry?.nodeName ||
+    ""
+  )
+    .toLowerCase()
+    .trim();
+
+/**
+ * Extract the execution_output object from an audit entry.
+ * Handles both a direct `execution_output` key and values nested under
+ * `response` / `output` / `result`.
+ */
+const extractExecutionOutput = (entry) => {
+  if (!entry || typeof entry !== "object") return null;
+
+  if (entry.execution_output && typeof entry.execution_output === "object") {
+    return entry.execution_output;
+  }
+
+  const nested = entry.response ?? entry.output ?? entry.result;
+  if (nested && typeof nested === "object") {
+    if (nested.execution_output && typeof nested.execution_output === "object") {
+      return nested.execution_output;
+    }
+    // The nested object itself may be the execution_output (some API variants)
+    if (Object.keys(nested).length > 0) return nested;
+  }
+
+  return null;
+};
+
+/**
+ * Build a { "UI Label": "value ✓/✗" } flags map from a node's execution_output.
+ *
+ * @param {object} executionOutput - Raw execution_output from the audit entry.
+ * @param {object} outputMap       - { autoId -> displayName } from the workflow
+ *                                   definition (may be empty when fetch failed).
+ * @param {object} labelMap        - { displayName -> "UI Label" } mapping.
+ */
+const buildFlagsFromOutput = (executionOutput, outputMap, labelMap) => {
+  if (!executionOutput || typeof executionOutput !== "object") return null;
+
+  const flags = {};
+  for (const [key, rawValue] of Object.entries(executionOutput)) {
+    // Resolve: auto-id → displayName (falls back to the key itself when the
+    // outputMap is empty or the key is already a display_name string).
+    const displayName = outputMap[key] || key;
+    const uiLabel = labelMap[displayName];
+    if (!uiLabel) continue;
+
+    const textValue = toCleanText(rawValue, "Not available");
+    flags[uiLabel] = toUiFlagValue(textValue);
+  }
+
+  return Object.keys(flags).length > 0 ? flags : null;
+};
+
+/**
+ * Extract Agent 6 summary fields (decision, reason, case_status,
+ * application_status, deficiency_list) from an execution_output and merge
+ * them into the provided accumulator object.
+ */
+const extractAgent6SummaryFields = (executionOutput, outputMap, acc) => {
+  if (!executionOutput || typeof executionOutput !== "object") return;
+  for (const [key, rawValue] of Object.entries(executionOutput)) {
+    const displayName = outputMap[key] || key;
+    if (AGENT6_SUMMARY_DISPLAY_NAMES.has(displayName)) {
+      acc[displayName] = toCleanText(rawValue, "");
+    }
+  }
+};
+
+/**
+ * Extract the `flagged_or_verified` summary field from a Document Screening
+ * execution_output and merge it into the accumulator.
+ */
+const extractDocScreeningSummaryFields = (executionOutput, outputMap, acc) => {
+  if (!executionOutput || typeof executionOutput !== "object") return;
+  for (const [key, rawValue] of Object.entries(executionOutput)) {
+    const displayName = outputMap[key] || key;
+    if (displayName === "flagged_or_verified") {
+      acc.flagged_or_verified = toCleanText(rawValue, "");
+    }
+  }
+};
+
+/**
+ * Poll the OPUS job audit (and status) until one of:
+ *  1. Agent 6 AND Document Screening outputs are available in the audit →
+ *     persist flags, return { status: "REVIEW_READY", result: { flags… } }
+ *  2. Job status becomes COMPLETED → fetch result and return normally
+ *  3. Job status becomes FAILED/CANCELLED with no partial data → throw
+ *  4. Timeout (120 × 5 s = 10 min) with partial data → REVIEW_READY
+ *  5. Timeout with no data at all → throw
+ *
+ * This replaces the old waitForJobCompletion which only looked for COMPLETED
+ * and timed out to FAILED when the workflow was paused at Off-Platform Review.
+ */
+const pollAuditUntilDone = async (jobExecutionId) => {
+  const maxAttempts = 120;
+  const intervalMs = 5000;
+
+  // Fetch the V2 workflow object once for display-name resolution.
+  // The service caches it for 1 h so this is cheap on repeat calls.
+  const workflowObj = await getV2WorkflowObject(WORKFLOW_ID_PRIMARY).catch(() => null);
+  const agent6OutputMap = resolveNodeOutputsByDisplayName(workflowObj, "Agent 6");
+  const docScreeningOutputMap = resolveNodeOutputsByDisplayName(workflowObj, "Document Screening");
+
+  let agent6Flags = null;
+  let docScreeningFlags = null;
+  const summaryFields = {};
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    // ── 1. Check terminal status ──────────────────────────────────────────
+    let currentStatus = null;
+    try {
+      const statusPayload = await getJobStatus(jobExecutionId);
+      currentStatus = statusPayload?.status;
+    } catch {
+      // Status check failed; keep going with the audit.
+    }
+
+    if (currentStatus === "COMPLETED") {
+      const resultPayload = await getJobResult(jobExecutionId);
+      return { status: "COMPLETED", result: toKeyedResult(resultPayload) };
+    }
+
+    if (
+      ["FAILED", "CANCELLED"].includes(currentStatus) &&
+      !agent6Flags &&
+      !docScreeningFlags
+    ) {
+      throw new Error(`Job did not complete successfully. Last status: ${currentStatus}`);
+    }
+
+    // ── 2. Poll the audit for node execution outputs ──────────────────────
+    try {
+      const auditData = await getJobAudit(jobExecutionId);
+      const entries = normalizeAuditData(auditData);
+
+      for (const entry of entries) {
+        const nodeName = getAuditEntryNodeName(entry);
+        const output = extractExecutionOutput(entry);
+        if (!output) continue;
+
+        if (!agent6Flags && AGENT6_NAME_TOKENS.some((t) => nodeName.includes(t))) {
+          agent6Flags = buildFlagsFromOutput(output, agent6OutputMap, AGENT6_LABEL_MAP);
+          extractAgent6SummaryFields(output, agent6OutputMap, summaryFields);
+        }
+
+        if (
+          !docScreeningFlags &&
+          DOC_SCREENING_NAME_TOKENS.some((t) => nodeName.includes(t))
+        ) {
+          docScreeningFlags = buildFlagsFromOutput(
+            output,
+            docScreeningOutputMap,
+            DOC_SCREENING_LABEL_MAP
+          );
+          extractDocScreeningSummaryFields(output, docScreeningOutputMap, summaryFields);
+        }
+      }
+    } catch {
+      // Audit fetch failed; keep polling.
+    }
+
+    // ── 3. Once both evaluation nodes have output, the job is parked ──────
+    if (agent6Flags && docScreeningFlags) {
+      return {
+        status: "REVIEW_READY",
+        result: {
+          completeness_flags: agent6Flags,
+          screening_flags: docScreeningFlags,
+          ...summaryFields,
+        },
+      };
+    }
+
+    // ── 4. FAILED/CANCELLED but we have some partial data – stop gracefully
+    if (["FAILED", "CANCELLED"].includes(currentStatus)) {
+      return { status: currentStatus, result: {} };
+    }
+
+    await sleep(intervalMs);
+  }
+
+  // ── 5. Timeout handling ────────────────────────────────────────────────
+  if (agent6Flags || docScreeningFlags) {
+    return {
+      status: "REVIEW_READY",
+      result: {
+        ...(agent6Flags ? { completeness_flags: agent6Flags } : {}),
+        ...(docScreeningFlags ? { screening_flags: docScreeningFlags } : {}),
+        ...summaryFields,
+      },
+    };
+  }
+
+  throw new Error("Timed out waiting for Opus workflow completion");
 };
 
 const isFinalizedDecision = (value) => {
@@ -507,7 +786,7 @@ const toInboxCase = (job) => ({
   request_type: job.request_type || "New",
   case_status: resolveCaseStatus(job),
   application_status:
-    job.status === "HITL_PENDING"
+    job.status === "HITL_PENDING" || job.status === "REVIEW_READY"
       ? "Pending Human Review"
       : job.status === "COMPLETED" || job.status === "IN PROGRESS"
         ? resolveDecision(job)
@@ -516,6 +795,7 @@ const toInboxCase = (job) => ({
   is_human_review_ready:
     Boolean(job.isOffPlatformReview) ||
     job.status === "HITL_PENDING" ||
+    job.status === "REVIEW_READY" ||
     normalizeActions(job.available_actions).length > 0,
   // Surface the HITL thread id (== OPUS execution id) so the FE can navigate
   // straight to /hitl/:threadId for off-platform reviews instead of the
@@ -532,6 +812,7 @@ const resolveScreeningStatus = (job = {}) => {
   if (job.status === "IN PROGRESS" || job.status === "IN_PROGRESS") return "In Progress";
   if (
     job.status === "HITL_PENDING" ||
+    job.status === "REVIEW_READY" ||
     (Boolean(job.isOffPlatformReview) && normalizeActions(job.available_actions).length > 0)
   )
     return "Pending Human Review";
@@ -543,12 +824,13 @@ const toCaseInfo = (job) => ({
   applicant_name: resolveApplicantName(job),
   request_type: job.request_type || "New",
   screening_status: resolveScreeningStatus(job),
-  // For HITL cases, the application's lifecycle is "Pending Human Review" —
-  // not the agent's recommendation. Showing Agent 6's recommendation here
-  // confuses the reviewer ("Status: Process" reads like the case is already
-  // moving forward). Use resolveDecision only once the workflow completes.
+  // For HITL cases and audit-ready cases, the application's lifecycle is
+  // "Pending Human Review" — not the agent's recommendation.
+  // Showing Agent 6's recommendation here confuses the reviewer
+  // ("Status: Process" reads like the case is already moving forward).
+  // Use resolveDecision only once the workflow completes.
   application_status:
-    job.status === "HITL_PENDING"
+    job.status === "HITL_PENDING" || job.status === "REVIEW_READY"
       ? "Pending Human Review"
       : job.status === "COMPLETED" || job.status === "IN PROGRESS"
         ? resolveDecision(job)
@@ -638,7 +920,11 @@ const toScreeningResult = (job) => {
 
 const hasScreeningData = (job = {}) => {
   const status = String(job.status || "").toUpperCase();
-  if (["IN PROGRESS", "IN_PROGRESS", "COMPLETED", "FAILED", "CANCELLED"].includes(status)) {
+  if (
+    ["IN PROGRESS", "IN_PROGRESS", "COMPLETED", "FAILED", "CANCELLED", "REVIEW_READY"].includes(
+      status
+    )
+  ) {
     return true;
   }
 
@@ -1044,29 +1330,6 @@ const notifyOffPlatformDecision = async (job, action, mappedDecision) => {
   });
 };
 
-const waitForJobCompletion = async (jobExecutionId) => {
-  const maxAttempts = 120;
-  const intervalMs = 5000;
-
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const statusPayload = await getJobStatus(jobExecutionId);
-    const status = statusPayload?.status;
-
-    if (status === "COMPLETED") {
-      const resultPayload = await getJobResult(jobExecutionId);
-      return { status, result: toKeyedResult(resultPayload) };
-    }
-
-    if (["FAILED", "CANCELLED"].includes(status)) {
-      throw new Error(`Job did not complete successfully. Last status: ${status}`);
-    }
-
-    await sleep(intervalMs);
-  }
-
-  throw new Error("Timed out waiting for Opus workflow completion");
-};
-
 const watchJobCompletion = (jobExecutionId) => {
   if (activeJobWatchers.has(jobExecutionId)) {
     return;
@@ -1074,8 +1337,19 @@ const watchJobCompletion = (jobExecutionId) => {
 
   const watchPromise = (async () => {
     try {
-      const { status, result } = await waitForJobCompletion(jobExecutionId);
-      updateJobResult(String(jobExecutionId), { status, ...result });
+      const { status, result } = await pollAuditUntilDone(jobExecutionId);
+
+      if (status === "REVIEW_READY") {
+        // The workflow is parked at the Off-Platform Review node.
+        // Persist the extracted evaluation flags (completeness_flags,
+        // screening_flags, and any summary fields) without overwriting the
+        // job's current status so the candidate profile page shows the real
+        // data instead of "Not available".  The job remains "IN PROGRESS"
+        // until a human decision arrives via the HITL webhook.
+        updateJobResult(String(jobExecutionId), result);
+      } else {
+        updateJobResult(String(jobExecutionId), { status, ...result });
+      }
     } catch (error) {
       updateJobResult(String(jobExecutionId), {
         status: "FAILED",

@@ -212,6 +212,37 @@ export const buildWorkflowReviewMeta = (workflowObj) => {
 };
 
 /**
+ * Given a workflow object and a node name (case-insensitive exact match),
+ * returns a map of { autoId -> displayName } for every field in that node's
+ * output_schema.schema.
+ *
+ * This lets the watcher resolve auto-generated ids (e.g. "workflow_output_xxxx")
+ * from the OPUS job audit back to the stable display_name the workflow author
+ * typed (e.g. "id_proof_and_personal_details_check") without hard-coding
+ * auto-ids that change every time the workflow is rebuilt.
+ *
+ * Returns an empty object when the node is not found or has no output schema.
+ */
+export const resolveNodeOutputsByDisplayName = (workflowObj, nodeName) => {
+  if (!workflowObj?.nodes || !nodeName) return {};
+
+  const target = String(nodeName).toLowerCase().trim();
+  const node = Object.values(workflowObj.nodes).find(
+    (n) => String(n.name || "").toLowerCase().trim() === target
+  );
+
+  if (!node?.output_schema?.schema) return {};
+
+  const map = {};
+  for (const [autoId, field] of Object.entries(node.output_schema.schema)) {
+    if (field && typeof field === "object") {
+      map[autoId] = field.display_name || field.variable_name || autoId;
+    }
+  }
+  return map;
+};
+
+/**
  * Test hook: clear the in-memory cache (used by tests / dev workflows).
  */
 export const _clearWorkflowCache = () => cache.clear();
