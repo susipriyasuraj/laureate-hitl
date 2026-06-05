@@ -521,7 +521,12 @@ const isFailSignal = (value = "") => {
     v.includes("unable to") ||
     v.includes("not available") ||
     v.includes("not present") ||
-    v.includes("absent")
+    v.includes("absent") ||
+    v.includes("under ") ||
+    v.includes("does not meet") ||
+    v.includes("not meet") ||
+    v.includes("not satisfied") ||
+    v.includes("unverified")
   );
 };
 
@@ -531,14 +536,39 @@ const toUiFlagValue = (value) => {
 };
 
 /**
- * Normalise an OPUS audit response into a flat array of node execution entries
- * regardless of whether the API returns an array at root or an object with an
- * executed_nodes / result / audit field.
+ * Normalise an OPUS audit response into a flat array of node execution entries.
+ *
+ * The real audit shape (verified against GET /job/:id/audit) is:
+ *   {
+ *     "executed_nodes": ["Input", "Agent 6", …],        // plain strings
+ *     "audit": {
+ *       "nodes_execution_data": {
+ *         "Agent 6":            { execution_status, execution_output: [...] },
+ *         "Document Screening": { execution_status, execution_output: [...] }
+ *       }
+ *     }
+ *   }
+ *
+ * `nodes_execution_data` is an object keyed by node name — we convert it to
+ * an array of { node_name, ...data } entries so downstream helpers can iterate.
+ * Fallbacks are kept for other possible API variants.
  */
 const normalizeAuditData = (auditData) => {
   if (!auditData) return [];
   if (Array.isArray(auditData)) return auditData;
-  if (Array.isArray(auditData.executed_nodes)) return auditData.executed_nodes;
+
+  // Primary path: audit.nodes_execution_data is an object keyed by node name.
+  const nodesExecData =
+    auditData.audit?.nodes_execution_data ||
+    auditData.nodes_execution_data;
+  if (nodesExecData && typeof nodesExecData === "object" && !Array.isArray(nodesExecData)) {
+    return Object.entries(nodesExecData).map(([name, data]) => ({
+      node_name: name,
+      ...(data && typeof data === "object" ? data : {}),
+    }));
+  }
+
+  // Fallbacks for other API variants (array-based responses).
   if (Array.isArray(auditData.result)) return auditData.result;
   if (Array.isArray(auditData.audit)) return auditData.audit;
   if (Array.isArray(auditData.steps)) return auditData.steps;
@@ -559,23 +589,27 @@ const getAuditEntryNodeName = (entry) =>
     .trim();
 
 /**
- * Extract the execution_output object from an audit entry.
- * Handles both a direct `execution_output` key and values nested under
- * `response` / `output` / `result`.
+ * Extract the execution_output from an audit entry.
+ *
+ * After normalizeAuditData, each entry is { node_name, execution_output, … }.
+ * The real execution_output is an **array** of objects:
+ *   [ { variable_name, display_name, value, type }, … ]
+ *
+ * We return whatever is in execution_output (array or object) so
+ * buildFlagsFromOutput can handle it.
  */
 const extractExecutionOutput = (entry) => {
   if (!entry || typeof entry !== "object") return null;
 
-  if (entry.execution_output && typeof entry.execution_output === "object") {
-    return entry.execution_output;
-  }
+  const output = entry.execution_output;
+  if (Array.isArray(output) && output.length > 0) return output;
+  if (output && typeof output === "object" && Object.keys(output).length > 0) return output;
 
   const nested = entry.response ?? entry.output ?? entry.result;
   if (nested && typeof nested === "object") {
-    if (nested.execution_output && typeof nested.execution_output === "object") {
-      return nested.execution_output;
-    }
-    // The nested object itself may be the execution_output (some API variants)
+    const nestedOutput = nested.execution_output;
+    if (Array.isArray(nestedOutput) && nestedOutput.length > 0) return nestedOutput;
+    if (nestedOutput && typeof nestedOutput === "object" && Object.keys(nestedOutput).length > 0) return nestedOutput;
     if (Object.keys(nested).length > 0) return nested;
   }
 
@@ -585,24 +619,45 @@ const extractExecutionOutput = (entry) => {
 /**
  * Build a { "UI Label": "value ✓/✗" } flags map from a node's execution_output.
  *
- * @param {object} executionOutput - Raw execution_output from the audit entry.
- * @param {object} outputMap       - { autoId -> displayName } from the workflow
- *                                   definition (may be empty when fetch failed).
- * @param {object} labelMap        - { displayName -> "UI Label" } mapping.
+ * The real execution_output is an **array** of objects:
+ *   [ { variable_name: "workflow_output_xxx", display_name: "...", value: "Present", type: "str" }, … ]
+ *
+ * We resolve each item's variable_name through the outputMap (autoId → displayName)
+ * and then through the labelMap (displayName → UI label).
+ *
+ * Falls back to dict iteration for legacy/alternative API shapes.
+ *
+ * @param {Array|object} executionOutput - Raw execution_output from the audit entry.
+ * @param {object} outputMap             - { autoId -> displayName } from the workflow def.
+ * @param {object} labelMap              - { displayName -> "UI Label" } mapping.
  */
 const buildFlagsFromOutput = (executionOutput, outputMap, labelMap) => {
-  if (!executionOutput || typeof executionOutput !== "object") return null;
+  if (!executionOutput) return null;
 
   const flags = {};
-  for (const [key, rawValue] of Object.entries(executionOutput)) {
-    // Resolve: auto-id → displayName (falls back to the key itself when the
-    // outputMap is empty or the key is already a display_name string).
-    const displayName = outputMap[key] || key;
-    const uiLabel = labelMap[displayName];
-    if (!uiLabel) continue;
 
-    const textValue = toCleanText(rawValue, "Not available");
-    flags[uiLabel] = toUiFlagValue(textValue);
+  if (Array.isArray(executionOutput)) {
+    // Primary path: execution_output is an array of { variable_name, value, … }
+    for (const item of executionOutput) {
+      if (!item || typeof item !== "object") continue;
+      const varName = item.variable_name || item.display_name || "";
+      const displayName = outputMap[varName] || item.display_name || varName;
+      const uiLabel = labelMap[displayName];
+      if (!uiLabel) continue;
+
+      const textValue = toCleanText(item.value, "Not available");
+      flags[uiLabel] = toUiFlagValue(textValue);
+    }
+  } else if (typeof executionOutput === "object") {
+    // Fallback: dict-shaped execution_output (legacy API variant)
+    for (const [key, rawValue] of Object.entries(executionOutput)) {
+      const displayName = outputMap[key] || key;
+      const uiLabel = labelMap[displayName];
+      if (!uiLabel) continue;
+
+      const textValue = toCleanText(rawValue, "Not available");
+      flags[uiLabel] = toUiFlagValue(textValue);
+    }
   }
 
   return Object.keys(flags).length > 0 ? flags : null;
@@ -614,11 +669,23 @@ const buildFlagsFromOutput = (executionOutput, outputMap, labelMap) => {
  * them into the provided accumulator object.
  */
 const extractAgent6SummaryFields = (executionOutput, outputMap, acc) => {
-  if (!executionOutput || typeof executionOutput !== "object") return;
-  for (const [key, rawValue] of Object.entries(executionOutput)) {
-    const displayName = outputMap[key] || key;
-    if (AGENT6_SUMMARY_DISPLAY_NAMES.has(displayName)) {
-      acc[displayName] = toCleanText(rawValue, "");
+  if (!executionOutput) return;
+
+  if (Array.isArray(executionOutput)) {
+    for (const item of executionOutput) {
+      if (!item || typeof item !== "object") continue;
+      const varName = item.variable_name || item.display_name || "";
+      const displayName = outputMap[varName] || item.display_name || varName;
+      if (AGENT6_SUMMARY_DISPLAY_NAMES.has(displayName)) {
+        acc[displayName] = toCleanText(item.value, "");
+      }
+    }
+  } else if (typeof executionOutput === "object") {
+    for (const [key, rawValue] of Object.entries(executionOutput)) {
+      const displayName = outputMap[key] || key;
+      if (AGENT6_SUMMARY_DISPLAY_NAMES.has(displayName)) {
+        acc[displayName] = toCleanText(rawValue, "");
+      }
     }
   }
 };
@@ -628,11 +695,23 @@ const extractAgent6SummaryFields = (executionOutput, outputMap, acc) => {
  * execution_output and merge it into the accumulator.
  */
 const extractDocScreeningSummaryFields = (executionOutput, outputMap, acc) => {
-  if (!executionOutput || typeof executionOutput !== "object") return;
-  for (const [key, rawValue] of Object.entries(executionOutput)) {
-    const displayName = outputMap[key] || key;
-    if (displayName === "flagged_or_verified") {
-      acc.flagged_or_verified = toCleanText(rawValue, "");
+  if (!executionOutput) return;
+
+  if (Array.isArray(executionOutput)) {
+    for (const item of executionOutput) {
+      if (!item || typeof item !== "object") continue;
+      const varName = item.variable_name || item.display_name || "";
+      const displayName = outputMap[varName] || item.display_name || varName;
+      if (displayName === "flagged_or_verified") {
+        acc.flagged_or_verified = toCleanText(item.value, "");
+      }
+    }
+  } else if (typeof executionOutput === "object") {
+    for (const [key, rawValue] of Object.entries(executionOutput)) {
+      const displayName = outputMap[key] || key;
+      if (displayName === "flagged_or_verified") {
+        acc.flagged_or_verified = toCleanText(rawValue, "");
+      }
     }
   }
 };
@@ -1567,10 +1646,28 @@ export const getLatestScreeningResultController = async (req, res) => {
   try {
     ensureSeedDataFromExcel();
     const studentId = String(req.params.studentId || "").trim();
-    const job = findLatestJobByStudentId(studentId);
+    let job = findLatestJobByStudentId(studentId);
 
     if (!job) {
       return res.status(404).json({ detail: "Case not found" });
+    }
+
+    // On-read refresh: if the job is parked at REVIEW_READY or still IN PROGRESS,
+    // do a quick status check against OPUS. If the workflow has reached COMPLETED
+    // (i.e. the human review was submitted and Agent 7 / Output ran), fetch the
+    // final result and persist it so the candidate page reflects the decision.
+    const refreshableStatuses = ["REVIEW_READY", "IN PROGRESS", "IN_PROGRESS"];
+    if (refreshableStatuses.includes(job.status) && job.jobId && /^\d{4,}$/.test(String(job.jobId))) {
+      try {
+        const statusPayload = await getJobStatus(String(job.jobId));
+        if (statusPayload?.status === "COMPLETED") {
+          const resultPayload = await getJobResult(String(job.jobId));
+          const keyedResult = toKeyedResult(resultPayload);
+          job = updateJobResult(String(job.jobId), { status: "COMPLETED", ...keyedResult });
+        }
+      } catch {
+        // Status check failed; serve stale data gracefully.
+      }
     }
 
     return res.status(200).json(buildRealtimeCasePayload(job));

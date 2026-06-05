@@ -6,8 +6,16 @@ import { DatabaseSync } from "node:sqlite";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dbPath = path.join(__dirname, "../data/jobs.db");
-const legacyJsonPath = path.join(__dirname, "../data/jobs.json");
+const dataDir = path.join(__dirname, "../data");
+const dbPath = path.join(dataDir, "jobs.db");
+const legacyJsonPath = path.join(dataDir, "jobs.json");
+
+// Ensure the data directory exists before SQLite tries to create the DB file.
+// On a fresh Azure App Service deploy the directory may not exist yet because
+// the runtime-generated .db files are excluded from the deployment package.
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
 
 const jobEvents = new EventEmitter();
 jobEvents.setMaxListeners(0);
