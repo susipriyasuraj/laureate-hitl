@@ -1764,6 +1764,97 @@ export const triggerScreeningController = async (req, res) => {
   }
 };
 
+/**
+ * A canonical HITL dispatch carries only a UUID execution id — no student id —
+ * so we can't match it to a candidate by id. When the workflow was triggered
+ * from our app, the candidate's own screening job is sitting in-flight, parked
+ * at the Off-Platform Review node. That job is the one to attach the dispatch
+ * to, so the Approve action and agent decision land on the candidate's case
+ * page instead of on a standalone "orphan" record.
+ *
+ * Returns the most-recent real (numeric-id, non-synthetic) screening job that
+ * is still running / review-ready, or null when there is none (a genuine
+ * off-platform-only review started directly in OPUS).
+ */
+const findCandidateForHitlDispatch = () => {
+  const candidates = getAllJobs().filter((job) => {
+    if (job.isOffPlatformReview) return false;
+    if (isSyntheticOffPlatformStudentId(job.studentId)) return false;
+    if (String(job.studentId || "").toLowerCase().startsWith("hitl-")) return false;
+    if (!/^\d{4,}$/.test(String(job.jobId || ""))) return false; // real OPUS numeric id
+    const status = String(job.status || "").toUpperCase();
+    return ["IN PROGRESS", "IN_PROGRESS", "REVIEW_READY"].includes(status);
+  });
+  candidates.sort((a, b) => Number(b.jobId || 0) - Number(a.jobId || 0));
+  return candidates[0] || null;
+};
+
+/**
+ * Attach a canonical HITL dispatch to the candidate's in-flight screening job.
+ * Preserves the candidate's identity and any audit-derived evaluation flags,
+ * and layers on the review action, callback, and expected output schema so the
+ * candidate case page renders the Approve / Reject controls and the agent
+ * decision. The submit endpoint finds the job by its numeric id (== thread_id),
+ * so submitting the decision from the case page fires the dispatch's callback.
+ */
+const mergeHitlTaskIntoCandidate = (candidate, task, payload) => {
+  const hasFlags = (o) => o && typeof o === "object" && Object.keys(o).length > 0;
+  const merge = {
+    isOffPlatformReview: true,
+    status: "HITL_PENDING",
+    hitlStatus: task.hitlStatus || "PENDING",
+    available_actions: task.available_actions,
+    hitlCallback: task.hitlCallback,
+    hitlExpectedOutputSchema: task.hitlExpectedOutputSchema,
+    hitlExecutionId: task.hitlExecutionId,
+    hitlWorkflowId: task.hitlWorkflowId,
+    hitlWorkflowName: task.hitlWorkflowName,
+    hitlNodeExecutionId: task.hitlNodeExecutionId,
+    hitlInputs: task.hitlInputs,
+    hitlNodeOutput: task.hitlNodeOutput,
+    hitlInputSchema: task.hitlInputSchema,
+    hitlNodeOutputSchema: task.hitlNodeOutputSchema,
+    hitlWorkflowMeta: task.hitlWorkflowMeta,
+    hitlEvaluation: task.hitlEvaluation,
+    offPlatformThreadId: task.offPlatformThreadId,
+    offPlatformPayload: payload,
+    offPlatformLinkageMethod: "candidate_in_flight",
+    offPlatformLinkageMatchedBy: String(task.jobId),
+    offPlatformLinkedAt: new Date().toISOString(),
+    // The dispatch UUID — lets a re-dispatch of the same execution find this
+    // candidate again instead of creating a duplicate.
+    hitlLinkedExecutionId: String(task.jobId),
+    hitlAuditLog: [
+      ...(Array.isArray(candidate.hitlAuditLog) ? candidate.hitlAuditLog : []),
+      {
+        type: "webhook_linked_to_candidate",
+        at: new Date().toISOString(),
+        execution_id: String(task.jobId),
+        candidate_job_id: String(candidate.jobId),
+      },
+    ],
+    // Agent recommendation: prefer the dispatch's view, fall back to candidate.
+    decision: task.decision || candidate.decision,
+    reason: task.reason || candidate.reason,
+    case_status: task.case_status || candidate.case_status,
+    application_status: task.application_status || candidate.application_status,
+    deficiency_list:
+      task.deficiency_list && task.deficiency_list.length
+        ? task.deficiency_list
+        : candidate.deficiency_list,
+    flagged_or_verified: task.flagged_or_verified || candidate.flagged_or_verified,
+  };
+  // Keep the candidate's audit-derived evaluation cards; only borrow the
+  // dispatch's when the candidate has none yet.
+  if (!hasFlags(candidate.completeness_flags) && hasFlags(task.completeness_flags)) {
+    merge.completeness_flags = task.completeness_flags;
+  }
+  if (!hasFlags(candidate.screening_flags) && hasFlags(task.screening_flags)) {
+    merge.screening_flags = task.screening_flags;
+  }
+  return updateJobResult(String(candidate.jobId), merge);
+};
+
 export const offPlatformReviewWebhookController = async (req, res) => {
   try {
     if (!isWebhookRequestAuthorized(req)) {
@@ -1786,24 +1877,49 @@ export const offPlatformReviewWebhookController = async (req, res) => {
 
       // Async: enrichment fetches workflow definition from OPUS for display labels.
       const task = await buildHitlTaskFromWebhook(payload);
-      const existing = getAllJobs().find(
-        (item) => String(item.jobId || "") === String(task.jobId)
+
+      // 1. Idempotency: a re-dispatch of the same execution — update whichever
+      //    record already carries it (a previously-linked candidate, or a
+      //    standalone record saved under the execution id).
+      const alreadyLinked = getAllJobs().find(
+        (item) =>
+          String(item.hitlLinkedExecutionId || "") === String(task.jobId) ||
+          String(item.jobId || "") === String(task.jobId)
       );
 
-      const saved = existing
-        ? updateJobResult(String(task.jobId), {
-            ...task,
-            hitlAuditLog: [
-              ...(Array.isArray(existing.hitlAuditLog) ? existing.hitlAuditLog : []),
-              {
-                type: "webhook_received",
-                at: new Date().toISOString(),
-                execution_id: String(payload.execution_id),
-                workflow_id: String(payload.workflow_id),
-              },
-            ],
-          })
-        : createJob(task);
+      // 2. Otherwise attach the dispatch to the candidate's in-flight screening
+      //    job so the Approve action shows on the candidate's case page.
+      const candidate = alreadyLinked ? null : findCandidateForHitlDispatch();
+
+      let saved;
+      let linkage;
+      if (alreadyLinked) {
+        saved = updateJobResult(String(alreadyLinked.jobId), {
+          ...task,
+          jobId: alreadyLinked.jobId,
+          studentId: alreadyLinked.studentId,
+          applicant_name: alreadyLinked.applicant_name,
+          hitlLinkedExecutionId: String(task.jobId),
+          hitlAuditLog: [
+            ...(Array.isArray(alreadyLinked.hitlAuditLog) ? alreadyLinked.hitlAuditLog : []),
+            {
+              type: "webhook_received",
+              at: new Date().toISOString(),
+              execution_id: String(payload.execution_id),
+              workflow_id: String(payload.workflow_id),
+            },
+          ],
+        });
+        linkage = "existing";
+      } else if (candidate) {
+        saved = mergeHitlTaskIntoCandidate(candidate, task, payload);
+        linkage = "candidate_in_flight";
+      } else {
+        // No in-flight candidate — a genuine off-platform-only review. Keep the
+        // existing behaviour and create a standalone record.
+        saved = createJob(task);
+        linkage = "standalone";
+      }
 
       return res.status(202).json({
         message: "HITL task accepted",
@@ -1812,6 +1928,7 @@ export const offPlatformReviewWebhookController = async (req, res) => {
         student_id: String(saved.studentId || ""),
         available_actions: normalizeActions(saved.available_actions),
         hitl_status: String(saved.hitlStatus || "PENDING"),
+        linkage,
       });
     }
 
